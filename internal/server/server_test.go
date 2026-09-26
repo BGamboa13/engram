@@ -2111,9 +2111,14 @@ func TestPromptInboxIdentityHTTP(t *testing.T) {
 	if code != http.StatusCreated || replay != first || writes.Load() != 1 {
 		t.Fatalf("replay: %d %s writes=%d", code, replay, writes.Load())
 	}
-	code, _ = request(`{"session_id":"inbox-http","project":"other","content":"same","source_inbox_id":"a"}`)
-	if code == http.StatusCreated || writes.Load() != 1 {
-		t.Fatalf("wrong project: %d writes=%d", code, writes.Load())
+	code, rejected := request(`{"session_id":"inbox-http","project":"other","content":"same","source_inbox_id":"a"}`)
+	var rejection map[string]string
+	if err := json.Unmarshal([]byte(rejected), &rejection); err != nil {
+		t.Fatalf("decode wrong-project response: %v", err)
+	}
+	if code != http.StatusBadRequest || rejection["code"] != "session_project_mismatch" ||
+		rejection["error"] != "session project does not match requested project" || writes.Load() != 1 {
+		t.Fatalf("wrong project: %d %s writes=%d", code, rejected, writes.Load())
 	}
 }
 
