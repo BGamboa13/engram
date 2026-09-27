@@ -822,7 +822,11 @@ func TestPromptInboxIdentityStoreRetryReplaysCompetingWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer competing.Close()
+	defer func() {
+		if err := competing.Close(); err != nil {
+			t.Errorf("close competing prompt database: %v", err)
+		}
+	}()
 
 	originalCommit := s.hooks.commit
 	attempts := 0
