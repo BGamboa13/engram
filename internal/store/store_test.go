@@ -2993,15 +2993,17 @@ func TestNewMigratesLegacyUserPromptsSyncIDSchema(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	var syncID string
-	if err := s.db.QueryRow("SELECT sync_id FROM user_prompts WHERE content = ?", "legacy prompt").Scan(&syncID); err != nil {
-		t.Fatalf("query migrated prompt sync_id: %v", err)
+	var legacyID int64
+	var legacyContent, syncID string
+	var legacyInboxID sql.NullString
+	if err := s.db.QueryRow("SELECT id, content, sync_id, source_inbox_id FROM user_prompts WHERE session_id = ?", "s1").Scan(&legacyID, &legacyContent, &syncID, &legacyInboxID); err != nil {
+		t.Fatalf("query migrated legacy prompt: %v", err)
 	}
-	if syncID == "" {
-		t.Fatalf("expected migrated prompt sync_id to be backfilled")
+	if legacyID != 1 || legacyContent != "legacy prompt" || syncID == "" || legacyInboxID.Valid {
+		t.Fatalf("legacy prompt not preserved: id=%d content=%q sync_id=%q inbox_id=%v", legacyID, legacyContent, syncID, legacyInboxID)
 	}
 
-	var hasSyncIDColumn bool
+	var hasSyncIDColumn, hasInboxIDColumn bool
 	rows, err := s.db.Query("PRAGMA table_info(user_prompts)")
 	if err != nil {
 		t.Fatalf("query prompt columns: %v", err)
@@ -3014,20 +3016,24 @@ func TestNewMigratesLegacyUserPromptsSyncIDSchema(t *testing.T) {
 		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
 			t.Fatalf("scan prompt column: %v", err)
 		}
-		if name == "sync_id" {
+		switch name {
+		case "sync_id":
 			hasSyncIDColumn = true
-			break
+		case "source_inbox_id":
+			hasInboxIDColumn = true
 		}
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
+		if closeErr := rows.Close(); closeErr != nil {
+			t.Fatalf("iterate prompt columns: %v; close prompt columns: %v", err, closeErr)
+		}
 		t.Fatalf("iterate prompt columns: %v", err)
 	}
 	if err := rows.Close(); err != nil {
 		t.Fatalf("close prompt columns: %v", err)
 	}
-	if !hasSyncIDColumn {
-		t.Fatalf("expected user_prompts.sync_id column after migration")
+	if !hasSyncIDColumn || !hasInboxIDColumn {
+		t.Fatalf("expected sync_id and source_inbox_id columns after migration: sync=%v inbox=%v", hasSyncIDColumn, hasInboxIDColumn)
 	}
 
 	var indexName string
@@ -3036,6 +3042,39 @@ func TestNewMigratesLegacyUserPromptsSyncIDSchema(t *testing.T) {
 	}
 	if indexName != "idx_prompts_sync_id" {
 		t.Fatalf("expected idx_prompts_sync_id to exist, got %q", indexName)
+	}
+
+	var indexSQL string
+	if err := s.db.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_prompts_source_inbox' AND tbl_name = 'user_prompts'").Scan(&indexSQL); err != nil {
+		t.Fatalf("query prompt inbox index: %v", err)
+	}
+	if !strings.Contains(indexSQL, "UNIQUE INDEX") || !strings.Contains(indexSQL, "(session_id, source_inbox_id)") || !strings.Contains(indexSQL, "WHERE source_inbox_id IS NOT NULL") {
+		t.Fatalf("expected unique partial session/inbox index, got %q", indexSQL)
+	}
+
+	params := AddPromptParams{SessionID: "s1", Content: "new prompt", Project: "engram", SourceInboxID: "inbox-1"}
+	promptID, inserted, err := s.AddPromptWithResult(params)
+	if err != nil || !inserted || promptID <= 0 || promptID == legacyID {
+		t.Fatalf("insert inbox prompt: id=%d inserted=%v err=%v", promptID, inserted, err)
+	}
+	params.Content = "replayed prompt must not replace original"
+	replayID, inserted, err := s.AddPromptWithResult(params)
+	if err != nil || inserted || replayID != promptID {
+		t.Fatalf("replay inbox prompt: id=%d inserted=%v err=%v; original id=%d", replayID, inserted, err, promptID)
+	}
+	var count int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM user_prompts WHERE session_id = ?", "s1").Scan(&count); err != nil {
+		t.Fatalf("count prompts after replay: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected legacy and new prompt only, got %d", count)
+	}
+	var storedContent, storedSyncID string
+	if err := s.db.QueryRow("SELECT content, sync_id FROM user_prompts WHERE id = ?", legacyID).Scan(&storedContent, &storedSyncID); err != nil {
+		t.Fatalf("query legacy prompt after replay: %v", err)
+	}
+	if storedContent != legacyContent || storedSyncID != syncID {
+		t.Fatalf("legacy prompt changed after replay: content=%q sync_id=%q", storedContent, storedSyncID)
 	}
 }
 
