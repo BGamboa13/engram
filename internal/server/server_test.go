@@ -2107,6 +2107,16 @@ func TestPromptInboxIdentityHTTP(t *testing.T) {
 	if code != http.StatusCreated || writes.Load() != 1 {
 		t.Fatalf("first: %d %s writes=%d", code, first, writes.Load())
 	}
+	var created struct {
+		ID     int64  `json:"id"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(first), &created); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
+	if created.ID <= 0 || created.Status != "saved" {
+		t.Fatalf("first response: id=%d status=%q body=%s", created.ID, created.Status, first)
+	}
 	code, replay := request(payload)
 	if code != http.StatusCreated || replay != first || writes.Load() != 1 {
 		t.Fatalf("replay: %d %s writes=%d", code, replay, writes.Load())

@@ -2418,6 +2418,10 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 				body.Content = strings.TrimSpace(local.Content)
 				changed = true
 			}
+			if body.SourceInboxID == "" && err == nil && local.SourceInboxID != "" {
+				body.SourceInboxID = local.SourceInboxID
+				changed = true
+			}
 			missing := []string{}
 			if strings.TrimSpace(body.SessionID) == "" {
 				missing = append(missing, "session_id")
@@ -5942,6 +5946,29 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 			}
 		} else if err != sql.ErrNoRows {
 			return nil, fmt.Errorf("import prompt %d: %w", p.ID, err)
+		}
+		if p.SourceInboxID != "" {
+			var existingID int64
+			var existingSession, existingIdentity string
+			err := tx.QueryRow(`SELECT id, session_id, ifnull(source_inbox_id, '') FROM user_prompts WHERE sync_id = ? ORDER BY id DESC LIMIT 1`, syncID).Scan(&existingID, &existingSession, &existingIdentity)
+			if err != nil && err != sql.ErrNoRows {
+				return nil, fmt.Errorf("import prompt %d: lookup identity: %w", p.ID, err)
+			}
+			if err == nil {
+				if existingSession != p.SessionID || (existingIdentity != "" && existingIdentity != p.SourceInboxID) {
+					return nil, fmt.Errorf("import prompt %d: conflicting inbox identity", p.ID)
+				}
+				if existingIdentity == "" {
+					res, err := s.execHook(tx, `UPDATE user_prompts SET source_inbox_id = ? WHERE id = ? AND (source_inbox_id IS NULL OR source_inbox_id = '') AND NOT EXISTS (SELECT 1 FROM user_prompts WHERE session_id = ? AND source_inbox_id = ?)`, p.SourceInboxID, existingID, p.SessionID, p.SourceInboxID)
+					if err != nil {
+						return nil, fmt.Errorf("import prompt %d: adopt identity: %w", p.ID, err)
+					}
+					updated, err := res.RowsAffected()
+					if err != nil || updated != 1 {
+						return nil, fmt.Errorf("import prompt %d: inbox identity already owned: %v", p.ID, err)
+					}
+				}
+			}
 		}
 		res, err := s.execHook(tx,
 			`INSERT INTO user_prompts (sync_id, session_id, content, project, created_at, source_inbox_id)
