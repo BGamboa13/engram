@@ -1423,13 +1423,13 @@ func TestPulledSparsePromptDeletePrefersLivePromptProject(t *testing.T) {
 	}
 }
 
-func TestPulledPromptDeleteRejectsInboxWithoutSession(t *testing.T) {
+func TestPulledPromptDeleteQuarantinesInboxWithoutSession(t *testing.T) {
 	for _, session := range []string{"", " \t "} {
 		t.Run(fmt.Sprintf("session_%q", session), func(t *testing.T) {
 			s := newTestStore(t)
 			payload := fmt.Sprintf(`{"sync_id":"bad-key","session_id":%q,"source_inbox_id":"inbox","deleted":true}`, session)
-			if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: "bad-key", Op: SyncOpDelete, Payload: payload}); err == nil {
-				t.Fatal("accepted invalid inbox identity")
+			if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: "bad-key", Op: SyncOpDelete, Payload: payload}); err != nil {
+				t.Fatalf("quarantine invalid inbox identity: %v", err)
 			}
 			if got := scalarInt(t, s, `SELECT count(*) FROM prompt_tombstones WHERE sync_id = ?`, "bad-key"); got != 0 {
 				t.Fatalf("persisted invalid tombstone: %d", got)
@@ -6347,6 +6347,41 @@ func TestApplyPulledChunkIsAtomicAndRetrySafe(t *testing.T) {
 	}
 	if sessionCount != 1 {
 		t.Fatalf("expected exactly one imported session row, got %d", sessionCount)
+	}
+}
+
+func TestApplyPulledPromptDeleteInvalidInboxIdentityQuarantinesAndContinues(t *testing.T) {
+	for _, session := range []string{"", " \t "} {
+		t.Run(fmt.Sprintf("session=%q", session), func(t *testing.T) {
+			s := newTestStore(t)
+			payload := fmt.Sprintf(`{"sync_id":"bad-prompt","session_id":%q,"source_inbox_id":"inbox","deleted":true}`, session)
+			invalid := SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: "bad-prompt", Op: SyncOpDelete, Payload: payload}
+			if err := s.ApplyPulledMutation(DefaultSyncTargetKey, invalid); err != nil {
+				t.Fatalf("invalid pull: %v", err)
+			}
+			if got := scalarInt(t, s, `SELECT COUNT(*) FROM prompt_tombstones WHERE sync_id = 'bad-prompt'`); got != 0 {
+				t.Fatalf("invalid tombstones=%d", got)
+			}
+			rows, err := s.ListDeferred(ListDeferredOptions{Status: "dead"})
+			if err != nil || len(rows) != 1 || rows[0].PayloadRaw != payload || rows[0].ReasonCode != SyncPromptIdentityInvalidReasonCode || rows[0].RemoteSeq != 1 || rows[0].EntityKey != invalid.EntityKey || rows[0].Op != invalid.Op {
+				t.Fatalf("dead evidence=%+v, err=%v", rows, err)
+			}
+			state, err := s.GetSyncState(DefaultSyncTargetKey)
+			if err != nil || state.LastPulledSeq != 1 {
+				t.Fatalf("invalid cursor=%+v, err=%v", state, err)
+			}
+			valid := SyncMutation{Seq: 2, Entity: SyncEntityPrompt, EntityKey: "good-prompt", Op: SyncOpDelete, Payload: `{"sync_id":"good-prompt","session_id":"owner","source_inbox_id":"inbox","deleted":true}`}
+			if err := s.ApplyPulledMutation(DefaultSyncTargetKey, valid); err != nil {
+				t.Fatalf("valid pull: %v", err)
+			}
+			if got := scalarInt(t, s, `SELECT COUNT(*) FROM prompt_tombstones WHERE sync_id = 'good-prompt' AND session_id = 'owner' AND source_inbox_id = 'inbox'`); got != 1 {
+				t.Fatalf("valid keyed tombstones=%d", got)
+			}
+			state, err = s.GetSyncState(DefaultSyncTargetKey)
+			if err != nil || state.LastPulledSeq != 2 {
+				t.Fatalf("valid cursor=%+v, err=%v", state, err)
+			}
+		})
 	}
 }
 

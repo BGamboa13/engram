@@ -106,6 +106,8 @@ var (
 	ErrPulledSessionIdentityInvalid = errors.New("pulled session identity is invalid")
 	// ErrPulledObservationIdentityInvalid identifies a pulled observation whose payload and mutation identities disagree.
 	ErrPulledObservationIdentityInvalid = errors.New("pulled observation identity is invalid")
+	// ErrPulledPromptIdentityInvalid identifies a pulled prompt delete with an unusable keyed identity.
+	ErrPulledPromptIdentityInvalid = errors.New("pulled prompt identity is invalid")
 	// ErrPulledSessionDirectoryInvalid identifies a pulled or imported session that
 	// has no concrete directory and therefore cannot be admitted as cloud state.
 	ErrPulledSessionDirectoryInvalid = errors.New("pulled session directory is invalid")
@@ -352,6 +354,7 @@ const (
 
 	SyncSessionIdentityInvalidReasonCode     = "sync_session_identity_invalid"
 	SyncObservationIdentityInvalidReasonCode = "sync_observation_identity_invalid"
+	SyncPromptIdentityInvalidReasonCode      = "sync_prompt_identity_invalid"
 	SyncParentSessionMissingReasonCode       = "pulled_parent_session_missing"
 
 	// relationDeferredOuterProjectAuthoritativeReasonCode records that a deferred
@@ -10552,6 +10555,8 @@ func pulledIdentityInvalidReasonCode(applyErr error) (string, bool) {
 		return SyncSessionIdentityInvalidReasonCode, true
 	case errors.Is(applyErr, ErrPulledObservationIdentityInvalid):
 		return SyncObservationIdentityInvalidReasonCode, true
+	case errors.Is(applyErr, ErrPulledPromptIdentityInvalid):
+		return SyncPromptIdentityInvalidReasonCode, true
 	default:
 		return "", false
 	}
@@ -11247,7 +11252,7 @@ func (s *Store) applyPromptDeleteTx(tx *sql.Tx, payload syncPromptPayload) error
 		payload.SourceInboxID = inboxID
 	}
 	if payload.SourceInboxID != "" && strings.TrimSpace(payload.SessionID) == "" {
-		return fmt.Errorf("delete prompt %q: session id is required for source inbox id", payload.SyncID)
+		return fmt.Errorf("%w: delete prompt %q: session id is required for source inbox id", ErrPulledPromptIdentityInvalid, payload.SyncID)
 	}
 	if payload.Project == nil || strings.TrimSpace(*payload.Project) == "" {
 		owner := promptProject
