@@ -2401,6 +2401,10 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 				body.Content = strings.TrimSpace(local.Content)
 				changed = true
 			}
+			if body.SourceInboxID == "" && err == nil && local.SourceInboxID != "" {
+				body.SourceInboxID = local.SourceInboxID
+				changed = true
+			}
 			missing := []string{}
 			if strings.TrimSpace(body.SessionID) == "" {
 				missing = append(missing, "session_id")

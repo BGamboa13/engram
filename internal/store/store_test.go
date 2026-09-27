@@ -4728,6 +4728,58 @@ func TestUpgradeRepairDryRunAndApply(t *testing.T) {
 		}
 	})
 
+	t.Run("legacy prompt repair retains authoritative inbox identity", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, localID, suppliedID, wantID string
+		}{
+			{"missing identity", "local-inbox", "", "local-inbox"},
+			{"supplied identity", "local-inbox", "supplied-inbox", "supplied-inbox"},
+			{"no local identity", "", "", ""},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newTestStore(t)
+				if err := s.CreateSession("prompt-repair-session", "prompt-repair-project", "/tmp/prompt-repair"); err != nil {
+					t.Fatalf("create session: %v", err)
+				}
+				if _, err := s.AddPrompt(AddPromptParams{SessionID: "prompt-repair-session", Project: "prompt-repair-project", Content: "authoritative content", SourceInboxID: tc.localID}); err != nil {
+					t.Fatalf("add prompt: %v", err)
+				}
+				if err := s.EnrollProject("prompt-repair-project"); err != nil {
+					t.Fatalf("enroll project: %v", err)
+				}
+				var syncID string
+				if err := s.db.QueryRow(`SELECT sync_id FROM user_prompts WHERE session_id = ?`, "prompt-repair-session").Scan(&syncID); err != nil {
+					t.Fatalf("lookup prompt sync ID: %v", err)
+				}
+				legacy, err := json.Marshal(syncPromptPayload{SyncID: syncID, SessionID: "prompt-repair-session", SourceInboxID: tc.suppliedID})
+				if err != nil {
+					t.Fatalf("encode legacy payload: %v", err)
+				}
+				if _, err := s.execHook(s.db, `UPDATE sync_mutations SET payload = ? WHERE entity = ? AND entity_key = ? AND op = ?`, string(legacy), SyncEntityPrompt, syncID, SyncOpUpsert); err != nil {
+					t.Fatalf("seed legacy mutation: %v", err)
+				}
+				report, err := s.RepairCloudUpgrade("prompt-repair-project", true)
+				if err != nil {
+					t.Fatalf("repair legacy prompt: %v", err)
+				}
+				if !report.Applied {
+					t.Fatalf("expected applied repair, got %+v", report)
+				}
+				var payload string
+				if err := s.db.QueryRow(`SELECT payload FROM sync_mutations WHERE entity = ? AND entity_key = ? AND op = ? ORDER BY seq DESC LIMIT 1`, SyncEntityPrompt, syncID, SyncOpUpsert).Scan(&payload); err != nil {
+					t.Fatalf("load repaired payload: %v", err)
+				}
+				var repaired syncPromptPayload
+				if err := decodeSyncPayload([]byte(payload), &repaired); err != nil {
+					t.Fatalf("decode repaired payload: %v", err)
+				}
+				if repaired.SourceInboxID != tc.wantID || repaired.Content != "authoritative content" {
+					t.Fatalf("repaired prompt = %+v, want inbox ID %q and authoritative content", repaired, tc.wantID)
+				}
+			})
+		}
+	})
+
 	t.Run("legacy relation mutation payload is repaired from authoritative local relation", func(t *testing.T) {
 		s := newTestStore(t)
 		if err := s.CreateSession("legacy-rel-s1", "legacy-rel-proj", "/tmp/legacy-rel"); err != nil {
