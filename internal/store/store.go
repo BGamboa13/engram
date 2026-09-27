@@ -5911,13 +5911,55 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 		if tombstone.SyncID == "" {
 			return nil, errors.New("import prompt tombstone: sync id is required")
 		}
-		if tombstone.SourceInboxID != "" {
-			if _, err := s.execHook(tx, `DELETE FROM user_prompts WHERE session_id = ? AND source_inbox_id = ?`, tombstone.SessionID, tombstone.SourceInboxID); err != nil {
-				return nil, fmt.Errorf("import prompt tombstone %q: %w", tombstone.SyncID, err)
-			}
+		rows, err := s.queryItHook(tx, `SELECT sync_id, session_id, ifnull(project, ''), ifnull(source_inbox_id, '') FROM user_prompts WHERE sync_id = ? OR (? != '' AND session_id = ? AND source_inbox_id = ?)`, tombstone.SyncID, tombstone.SourceInboxID, tombstone.SessionID, tombstone.SourceInboxID)
+		if err != nil {
+			return nil, fmt.Errorf("import prompt tombstone %q: load local prompts: %w", tombstone.SyncID, err)
 		}
-		if _, err := s.execHook(tx, `DELETE FROM user_prompts WHERE sync_id = ?`, tombstone.SyncID); err != nil {
-			return nil, fmt.Errorf("import prompt tombstone %q: %w", tombstone.SyncID, err)
+		type deletedPrompt struct{ syncID, sessionID, project, inboxID string }
+		var matched []deletedPrompt
+		for rows.Next() {
+			var prompt deletedPrompt
+			if err := rows.Scan(&prompt.syncID, &prompt.sessionID, &prompt.project, &prompt.inboxID); err != nil {
+				return nil, fmt.Errorf("import prompt tombstone %q: scan local prompt: %w", tombstone.SyncID, closeRowsWithError(rows, err))
+			}
+			matched = append(matched, prompt)
+		}
+		if err := closeRowsWithError(rows, rows.Err()); err != nil {
+			return nil, fmt.Errorf("import prompt tombstone %q: read local prompts: %w", tombstone.SyncID, err)
+		}
+		for _, prompt := range matched {
+			project, _ := NormalizeProject(prompt.project)
+			if project == "" {
+				project, err = s.resolveSessionProjectTx(tx, prompt.sessionID)
+				if err != nil {
+					return nil, fmt.Errorf("import prompt tombstone %q: resolve project: %w", prompt.syncID, err)
+				}
+			}
+			if _, err := s.execHook(tx, `DELETE FROM user_prompts WHERE sync_id = ?`, prompt.syncID); err != nil {
+				return nil, fmt.Errorf("import prompt tombstone %q: %w", prompt.syncID, err)
+			}
+			if err := s.recordPromptTombstoneTx(tx, prompt.syncID, prompt.sessionID, nullableString(project), prompt.inboxID, tombstone.DeletedAt); err != nil {
+				return nil, fmt.Errorf("import prompt tombstone %q: %w", prompt.syncID, err)
+			}
+			enrolled, err := isProjectEnrolledTx(tx, project)
+			if err != nil {
+				return nil, fmt.Errorf("import prompt tombstone %q: check enrollment: %w", prompt.syncID, err)
+			}
+			if enrolled {
+				deletedAt := tombstone.DeletedAt
+				payload := syncPromptPayload{SyncID: prompt.syncID, SessionID: prompt.sessionID, SourceInboxID: prompt.inboxID, Project: nullableString(project), Deleted: true, HardDelete: true, DeletedAt: &deletedAt}
+				if err := s.enqueueSyncMutationTx(tx, SyncEntityPrompt, prompt.syncID, SyncOpDelete, payload); err != nil {
+					return nil, fmt.Errorf("import prompt tombstone %q: enqueue delete: %w", prompt.syncID, err)
+				}
+			} else {
+				changed, err := s.supersedeDeletedEntityMutationTx(tx, SyncEntityPrompt, prompt.syncID, project)
+				if err != nil {
+					return nil, fmt.Errorf("import prompt tombstone %q: supersede mutation: %w", prompt.syncID, err)
+				}
+				if err := s.refreshSupersededProjectLifecycleTx(tx, project, changed); err != nil {
+					return nil, err
+				}
+			}
 		}
 		if err := s.recordPromptTombstoneTx(tx, tombstone.SyncID, tombstone.SessionID, tombstone.Project, tombstone.SourceInboxID, tombstone.DeletedAt); err != nil {
 			return nil, fmt.Errorf("import prompt tombstone %q: %w", tombstone.SyncID, err)

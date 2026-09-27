@@ -6062,6 +6062,66 @@ func TestApplyPulledPromptUpsertUpdatesCreatedAtOnExistingPrompt(t *testing.T) {
 	}
 }
 
+func TestImportPromptTombstoneJournalsMatchedLocalDelete(t *testing.T) {
+	for _, sameSyncID := range []bool{false, true} {
+		for _, repairFirst := range []bool{true, false} {
+			t.Run(fmt.Sprintf("sameSyncID=%t/repairFirst=%t", sameSyncID, repairFirst), func(t *testing.T) {
+				s := newTestStore(t)
+				enrollTestProject(t, s, "engram")
+				if err := s.CreateSession("import-delete-session", "engram", "/tmp/engram"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := s.db.Exec(`INSERT INTO user_prompts (sync_id, session_id, content, project, source_inbox_id) VALUES (?, ?, ?, ?, ?)`, "local-prompt", "import-delete-session", "hello", "engram", "inbox-1"); err != nil {
+					t.Fatal(err)
+				}
+				if repairFirst {
+					if err := s.EnsureEnrolledProjectSyncMutations(context.Background()); err != nil {
+						t.Fatal(err)
+					}
+				}
+				incomingID := "incoming-prompt"
+				if sameSyncID {
+					incomingID = "local-prompt"
+				}
+				deletedAt := Now()
+				data := &ExportData{PromptTombstones: []PromptTombstone{{SyncID: incomingID, SessionID: "import-delete-session", Project: nullableString("engram"), SourceInboxID: "inbox-1", DeletedAt: deletedAt}}}
+				for i := 0; i < 2; i++ {
+					if _, err := s.Import(data); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := s.EnsureEnrolledProjectSyncMutations(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				if got := scalarInt(t, s, `SELECT count(*) FROM user_prompts WHERE sync_id = ?`, "local-prompt"); got != 0 {
+					t.Fatalf("prompt remains: %d", got)
+				}
+				wantTombstones := 2
+				if sameSyncID {
+					wantTombstones = 1
+				}
+				if got := scalarInt(t, s, `SELECT count(*) FROM prompt_tombstones WHERE sync_id IN (?, ?)`, "local-prompt", incomingID); got != wantTombstones {
+					t.Fatalf("tombstones = %d, want %d", got, wantTombstones)
+				}
+				var payloadJSON string
+				if err := s.db.QueryRow(`SELECT payload FROM sync_mutations WHERE entity = 'prompt' AND entity_key = ? AND op = 'delete' AND project = 'engram' AND disposition = 'pending'`, "local-prompt").Scan(&payloadJSON); err != nil {
+					t.Fatalf("local pending delete: %v", err)
+				}
+				var payload syncPromptPayload
+				if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
+					t.Fatal(err)
+				}
+				if payload.SyncID != "local-prompt" || payload.SessionID != "import-delete-session" || payload.SourceInboxID != "inbox-1" || payload.Project == nil || *payload.Project != "engram" || !payload.Deleted || !payload.HardDelete || payload.DeletedAt == nil || *payload.DeletedAt != deletedAt {
+					t.Fatalf("pending delete payload = %+v", payload)
+				}
+				if got := scalarInt(t, s, `SELECT count(*) FROM sync_mutations WHERE entity = 'prompt' AND entity_key = ? AND op = 'delete' AND project = 'engram' AND disposition = 'pending'`, "local-prompt"); got != 1 {
+					t.Fatalf("local pending deletes = %d, want 1", got)
+				}
+			})
+		}
+	}
+}
+
 func TestDeletePromptEnqueuesDeleteMutationAndTombstone(t *testing.T) {
 	s := newTestStore(t)
 	enrollTestProject(t, s, "engram")
