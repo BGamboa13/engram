@@ -5912,6 +5912,9 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 		if tombstone.SyncID == "" {
 			return nil, errors.New("import prompt tombstone: sync id is required")
 		}
+		if tombstone.SourceInboxID != "" && strings.TrimSpace(tombstone.SessionID) == "" {
+			return nil, fmt.Errorf("import prompt tombstone %q: session id is required for source inbox id", tombstone.SyncID)
+		}
 		rows, err := s.queryItHook(tx, `SELECT sync_id, session_id, ifnull(project, ''), ifnull(source_inbox_id, '') FROM user_prompts WHERE sync_id = ? OR (? != '' AND session_id = ? AND source_inbox_id = ?)`, tombstone.SyncID, tombstone.SourceInboxID, tombstone.SessionID, tombstone.SourceInboxID)
 		if err != nil {
 			return nil, fmt.Errorf("import prompt tombstone %q: load local prompts: %w", tombstone.SyncID, err)

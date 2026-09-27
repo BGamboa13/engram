@@ -1310,6 +1310,38 @@ func TestPromptInboxIdentityDeletedLegacyBackup(t *testing.T) {
 	}
 }
 
+func TestImportRejectsInboxTombstoneWithoutSessionAtomically(t *testing.T) {
+	for _, sessionID := range []string{"", " \t "} {
+		t.Run(fmt.Sprintf("session_%q", sessionID), func(t *testing.T) {
+			s := newTestStore(t)
+			backup := &ExportData{
+				Version: currentExportVersion,
+				Sessions: []Session{{ID: "partial-import-session", Project: "engram", Directory: "/tmp", StartedAt: Now()}},
+				PromptTombstones: []PromptTombstone{{SyncID: "invalid-inbox-delete", SessionID: sessionID, SourceInboxID: "inbox-1", DeletedAt: Now()}},
+			}
+			if _, err := s.Import(backup); err == nil || !strings.Contains(err.Error(), "invalid-inbox-delete") {
+				t.Fatalf("import error = %v, want sync ID context", err)
+			}
+			if got := scalarInt(t, s, `SELECT count(*) FROM sessions WHERE id = ?`, "partial-import-session"); got != 0 {
+				t.Fatalf("partial session persisted: %d", got)
+			}
+			if got := scalarInt(t, s, `SELECT count(*) FROM prompt_tombstones WHERE sync_id = ?`, "invalid-inbox-delete"); got != 0 {
+				t.Fatalf("invalid tombstone persisted: %d", got)
+			}
+		})
+	}
+}
+
+func TestImportLegacyEmptySessionTombstone(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.Import(&ExportData{Version: currentExportVersion, PromptTombstones: []PromptTombstone{{SyncID: "legacy-empty-session", DeletedAt: Now()}}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM prompt_tombstones WHERE sync_id = ?`, "legacy-empty-session"); got != 1 {
+		t.Fatalf("legacy tombstone count = %d, want 1", got)
+	}
+}
+
 func TestPromptInboxIdentityDeletedBackup(t *testing.T) {
 	source := newTestStore(t)
 	if err := source.CreateSession("backup-deleted-inbox", "engram", "/tmp"); err != nil {
