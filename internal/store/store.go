@@ -5727,7 +5727,7 @@ func (s *Store) exportWithProjectScope(project string) (_ *ExportData, err error
 	tombstoneQuery := `SELECT t.sync_id, ifnull(t.session_id, ''), t.project, ifnull(t.source_inbox_id, ''), t.deleted_at FROM prompt_tombstones t`
 	tombstoneArgs := []any{}
 	if project != "" {
-		tombstoneQuery += ` LEFT JOIN sessions s ON s.id = t.session_id WHERE coalesce(nullif(t.project, ''), nullif(s.project, ''), '') = ?`
+		tombstoneQuery += ` LEFT JOIN sessions s ON s.id = t.session_id WHERE coalesce(nullif(t.project, ''), nullif(s.project, ''), (SELECT st.project FROM sync_delete_tombstones st WHERE st.entity = 'session' AND st.entity_key = t.session_id AND st.active = 1), '') = ?`
 		tombstoneArgs = append(tombstoneArgs, project)
 	}
 	tombstoneQuery += ` ORDER BY t.sync_id`
@@ -11236,14 +11236,27 @@ func (s *Store) applyPromptDeleteTx(tx *sql.Tx, payload syncPromptPayload) error
 	if strings.TrimSpace(payload.SyncID) == "" {
 		return nil
 	}
-	var sessionID, inboxID string
-	err := tx.QueryRow(`SELECT session_id, ifnull(source_inbox_id, '') FROM user_prompts WHERE sync_id = ?`, payload.SyncID).Scan(&sessionID, &inboxID)
+	var sessionID, inboxID, promptProject string
+	err := tx.QueryRow(`SELECT session_id, ifnull(source_inbox_id, ''), ifnull(project, '') FROM user_prompts WHERE sync_id = ?`, payload.SyncID).Scan(&sessionID, &inboxID, &promptProject)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 	if err == nil {
 		payload.SessionID = sessionID
 		payload.SourceInboxID = inboxID
+	}
+	if payload.SourceInboxID != "" && strings.TrimSpace(payload.SessionID) == "" {
+		return fmt.Errorf("delete prompt %q: session id is required for source inbox id", payload.SyncID)
+	}
+	if payload.Project == nil || strings.TrimSpace(*payload.Project) == "" {
+		owner := promptProject
+		if strings.TrimSpace(owner) == "" {
+			err := tx.QueryRow(`SELECT coalesce((SELECT nullif(project, '') FROM sessions WHERE id = ?), (SELECT project FROM sync_delete_tombstones WHERE entity = 'session' AND entity_key = ? AND active = 1), '')`, payload.SessionID, payload.SessionID).Scan(&owner)
+			if err != nil {
+				return err
+			}
+		}
+		payload.Project = nullableString(owner)
 	}
 	if _, err := s.execHook(tx, `DELETE FROM user_prompts WHERE sync_id = ?`, payload.SyncID); err != nil {
 		return err

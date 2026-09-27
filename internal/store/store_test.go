@@ -1242,6 +1242,132 @@ func TestPromptSparseDeleteRetainsProjectAfterSessionRemoval(t *testing.T) {
 	}
 }
 
+func TestPulledSparsePromptDeleteSurvivesSessionRemoval(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("sparse-owner", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	deletion := SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: "sparse-key", Op: SyncOpDelete, Payload: `{"sync_id":"sparse-key","session_id":"sparse-owner","source_inbox_id":"inbox","deleted":true}`}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, deletion); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSession("sparse-owner"); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := s.ExportProject("engram")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exported.PromptTombstones) != 1 || exported.PromptTombstones[0].SyncID != "sparse-key" {
+		t.Fatalf("missing project delete: %+v", exported.PromptTombstones)
+	}
+	other, err := s.ExportProject("other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(other.PromptTombstones) != 0 {
+		t.Fatalf("cross-project delete: %+v", other.PromptTombstones)
+	}
+	fresh := newTestStore(t)
+	if _, err := fresh.Import(exported); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.CreateSession("sparse-owner", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fresh.AddPromptWithResult(AddPromptParams{SessionID: "sparse-owner", Project: "engram", SourceInboxID: "inbox", Content: "replay"}); !errors.Is(err, ErrPromptInboxDeleted) {
+		t.Fatalf("replay: %v", err)
+	}
+}
+
+func TestExportProjectLegacyPromptDeleteUsesSessionTombstone(t *testing.T) {
+	s := newTestStore(t)
+	const sessionID = "legacy-sparse-owner"
+	const syncID = "legacy-sparse-key"
+	if err := s.CreateSession(sessionID, "alpha", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	deletion := SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: syncID, Op: SyncOpDelete, Payload: `{"sync_id":"legacy-sparse-key","session_id":"legacy-sparse-owner","deleted":true}`}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, deletion); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSession(sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`UPDATE prompt_tombstones SET project = NULL WHERE sync_id = ?`, syncID); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := s.ExportProject("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(owner.PromptTombstones) != 1 || owner.PromptTombstones[0].SyncID != syncID {
+		t.Fatalf("legacy prompt delete missing from owner export: %+v", owner.PromptTombstones)
+	}
+	other, err := s.ExportProject("beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(other.PromptTombstones) != 0 {
+		t.Fatalf("legacy prompt delete leaked to other project: %+v", other.PromptTombstones)
+	}
+}
+
+func TestPulledSparsePromptDeletePrefersLivePromptProject(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("cross-owner", "alpha", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	const syncID = "cross-project-prompt"
+	upsert := SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: syncID, Op: SyncOpUpsert, Payload: `{"sync_id":"cross-project-prompt","session_id":"cross-owner","project":"beta","content":"cross","source_inbox_id":"inbox"}`}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, upsert); err != nil {
+		t.Fatal(err)
+	}
+	deletion := SyncMutation{Seq: 2, Entity: SyncEntityPrompt, EntityKey: syncID, Op: SyncOpDelete, Payload: `{"sync_id":"cross-project-prompt","deleted":true}`}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, deletion); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSession("cross-owner"); err != nil {
+		t.Fatal(err)
+	}
+	beta, err := s.ExportProject("beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(beta.PromptTombstones) != 1 || beta.PromptTombstones[0].SyncID != syncID || beta.PromptTombstones[0].Project == nil || *beta.PromptTombstones[0].Project != "beta" {
+		t.Fatalf("beta lost prompt delete: %+v", beta.PromptTombstones)
+	}
+	alpha, err := s.ExportProject("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alpha.PromptTombstones) != 0 {
+		t.Fatalf("alpha leaked beta delete: %+v", alpha.PromptTombstones)
+	}
+}
+
+func TestPulledPromptDeleteRejectsInboxWithoutSession(t *testing.T) {
+	for _, session := range []string{"", " \t "} {
+		t.Run(fmt.Sprintf("session_%q", session), func(t *testing.T) {
+			s := newTestStore(t)
+			payload := fmt.Sprintf(`{"sync_id":"bad-key","session_id":%q,"source_inbox_id":"inbox","deleted":true}`, session)
+			if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: "bad-key", Op: SyncOpDelete, Payload: payload}); err == nil {
+				t.Fatal("accepted invalid inbox identity")
+			}
+			if got := scalarInt(t, s, `SELECT count(*) FROM prompt_tombstones WHERE sync_id = ?`, "bad-key"); got != 0 {
+				t.Fatalf("persisted invalid tombstone: %d", got)
+			}
+		})
+	}
+	s := newTestStore(t)
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: "legacy-key", Op: SyncOpDelete, Payload: `{"sync_id":"legacy-key","deleted":true}`}); err != nil {
+		t.Fatalf("legacy delete: %v", err)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM prompt_tombstones WHERE sync_id = ?`, "legacy-key"); got != 1 {
+		t.Fatalf("legacy tombstone: %d", got)
+	}
+}
+
 func TestPromptInboxIdentityDeletedPulledBackfill(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("pulled-backfill-inbox", "engram", "/tmp"); err != nil {
