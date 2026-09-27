@@ -1344,6 +1344,62 @@ func TestPromptInboxIdentityDeletedBackup(t *testing.T) {
 	}
 }
 
+func TestPromptInboxIdentityStoreRetryReplaysCompetingWrite(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("retry-inbox", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	p := AddPromptParams{SessionID: "retry-inbox", Project: "engram", Content: "attempt", SourceInboxID: "inbox-1"}
+	competing, err := sql.Open("sqlite", storeDSN(filepath.Join(s.cfg.DataDir, "engram.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer competing.Close()
+
+	originalCommit := s.hooks.commit
+	attempts := 0
+	var competingID int64
+	s.hooks.commit = func(tx *sql.Tx) error {
+		attempts++
+		if attempts != 1 {
+			return originalCommit(tx)
+		}
+		var pending int
+		if err := tx.QueryRow(`SELECT count(*) FROM user_prompts WHERE session_id = ? AND source_inbox_id = ?`, p.SessionID, p.SourceInboxID).Scan(&pending); err != nil {
+			return err
+		}
+		if pending != 1 {
+			t.Fatalf("first attempt prompt count = %d, want 1", pending)
+		}
+		if err := tx.Rollback(); err != nil {
+			return err
+		}
+		res, err := competing.ExecContext(context.Background(),
+			`INSERT INTO user_prompts (sync_id, session_id, content, project, source_inbox_id) VALUES (?, ?, ?, ?, ?)`,
+			"competing-prompt", p.SessionID, "competing", p.Project, p.SourceInboxID)
+		if err != nil {
+			return err
+		}
+		competingID, err = res.LastInsertId()
+		if err != nil {
+			return err
+		}
+		return errors.New("database is locked")
+	}
+	t.Cleanup(func() { s.hooks.commit = originalCommit })
+
+	id, inserted, err := s.AddPromptWithResult(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 || id != competingID || inserted {
+		t.Fatalf("attempts=%d id=%d competingID=%d inserted=%t; want two attempts, competing ID and false", attempts, id, competingID, inserted)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM user_prompts WHERE session_id='retry-inbox' AND source_inbox_id='inbox-1'`); got != 1 {
+		t.Fatalf("persisted prompts = %d, want 1", got)
+	}
+}
+
 func TestPromptInboxIdentityStoreConcurrentReplay(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("concurrent-inbox", "engram", "/tmp"); err != nil {

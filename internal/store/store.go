@@ -3812,6 +3812,7 @@ func (s *Store) AddPromptWithResult(p AddPromptParams) (int64, bool, error) {
 	var promptID int64
 	inserted := false
 	err := s.withTx(func(tx *sql.Tx) error {
+		inserted = false
 		{
 			// Settle ownership first: an unowned legacy session adopts this
 			// write's project rather than rejecting the write forever.
