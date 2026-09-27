@@ -11241,10 +11241,8 @@ func (s *Store) applyPromptDeleteTx(tx *sql.Tx, payload syncPromptPayload) error
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	if payload.SessionID == "" {
+	if err == nil {
 		payload.SessionID = sessionID
-	}
-	if payload.SourceInboxID == "" {
 		payload.SourceInboxID = inboxID
 	}
 	if _, err := s.execHook(tx, `DELETE FROM user_prompts WHERE sync_id = ?`, payload.SyncID); err != nil {

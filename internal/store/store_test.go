@@ -1143,6 +1143,36 @@ func TestPromptInboxIdentityDeletedPulled(t *testing.T) {
 	}
 }
 
+func TestPromptInboxIdentityPulledDeleteUsesLiveIdentity(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("live-delete-session", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	id, inserted, err := s.AddPromptWithResult(AddPromptParams{SessionID: "live-delete-session", Project: "engram", Content: "original", SourceInboxID: "live-key"})
+	if err != nil || !inserted {
+		t.Fatalf("create prompt: id=%d inserted=%v err=%v", id, inserted, err)
+	}
+	var syncID string
+	if err := s.DB().QueryRow(`SELECT sync_id FROM user_prompts WHERE id = ?`, id).Scan(&syncID); err != nil {
+		t.Fatal(err)
+	}
+	deletion := SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: syncID, Op: SyncOpDelete,
+		Payload: fmt.Sprintf(`{"sync_id":%q,"session_id":"wrong-session","source_inbox_id":"wrong-key","project":"engram","deleted":true}`, syncID)}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, deletion); err != nil {
+		t.Fatal(err)
+	}
+	var sessionID, inboxID string
+	if err := s.DB().QueryRow(`SELECT session_id, source_inbox_id FROM prompt_tombstones WHERE sync_id = ?`, syncID).Scan(&sessionID, &inboxID); err != nil {
+		t.Fatal(err)
+	}
+	if sessionID != "live-delete-session" || inboxID != "live-key" {
+		t.Fatalf("delete recorded payload identity instead of live identity: session=%q inbox=%q", sessionID, inboxID)
+	}
+	if id, inserted, err := s.AddPromptWithResult(AddPromptParams{SessionID: "live-delete-session", Project: "engram", Content: "replay", SourceInboxID: "live-key"}); !errors.Is(err, ErrPromptInboxDeleted) || id != 0 || inserted {
+		t.Fatalf("deleted identity was reused: id=%d inserted=%v err=%v", id, inserted, err)
+	}
+}
+
 func TestPromptInboxIdentityDeletedPulledAgainWithoutSession(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("repeated-delete-inbox", "engram", "/tmp"); err != nil {
