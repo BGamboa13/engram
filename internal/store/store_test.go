@@ -7069,6 +7069,73 @@ func TestImportOlderObservationDoesNotResurrectLocalDeletion(t *testing.T) {
 	}
 }
 
+func TestImportAdoptsLegacyPromptInboxIdentity(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("adopt-session", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.AddPrompt(AddPromptParams{SessionID: "adopt-session", Project: "engram", Content: "original"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncID := scalarString(t, s, `SELECT sync_id FROM user_prompts WHERE id = ?`, id)
+	incoming := &ExportData{Prompts: []Prompt{{SyncID: syncID, SessionID: "adopt-session", SourceInboxID: "inbox-a", Content: "imported", Project: "engram"}}}
+	result, err := s.Import(incoming)
+	if err != nil || result.PromptsImported != 0 {
+		t.Fatalf("import = %+v, %v", result, err)
+	}
+	if got := scalarString(t, s, `SELECT ifnull(source_inbox_id, '') FROM user_prompts WHERE id = ?`, id); got != "inbox-a" {
+		t.Fatalf("identity = %q", got)
+	}
+	replayed, inserted, err := s.AddPromptWithResult(AddPromptParams{SessionID: "adopt-session", Project: "engram", Content: "replay", SourceInboxID: "inbox-a"})
+	if err != nil || inserted || replayed != id {
+		t.Fatalf("replay = %d, %v, %v; original %d", replayed, inserted, err, id)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM user_prompts WHERE session_id = ?`, "adopt-session"); got != 1 {
+		t.Fatalf("prompt count = %d", got)
+	}
+}
+
+func TestImportRejectsConflictingPromptInboxIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name, localSession, localIdentity, incomingSession, incomingIdentity string
+		owner                                                                bool
+	}{
+		{"established", "s1", "original", "s1", "different", false},
+		{"cross session", "s1", "", "s2", "incoming", false},
+		{"already owned", "s1", "", "s1", "incoming", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			for _, session := range []string{"s1", "s2"} {
+				if err := s.CreateSession(session, "engram", "/tmp"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			id, _, err := s.AddPromptWithResult(AddPromptParams{SessionID: tc.localSession, Project: "engram", Content: "original", SourceInboxID: tc.localIdentity})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.owner {
+				if _, _, err := s.AddPromptWithResult(AddPromptParams{SessionID: "s1", Project: "engram", Content: "owner", SourceInboxID: tc.incomingIdentity}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			syncID := scalarString(t, s, `SELECT sync_id FROM user_prompts WHERE id = ?`, id)
+			_, err = s.Import(&ExportData{Prompts: []Prompt{{SyncID: syncID, SessionID: tc.incomingSession, SourceInboxID: tc.incomingIdentity, Content: "replacement", Project: "engram"}}})
+			if err == nil {
+				t.Fatal("expected identity conflict")
+			}
+			if got := scalarString(t, s, `SELECT ifnull(source_inbox_id, '') FROM user_prompts WHERE id = ?`, id); got != tc.localIdentity {
+				t.Fatalf("identity changed to %q", got)
+			}
+			if got := scalarString(t, s, `SELECT content FROM user_prompts WHERE id = ?`, id); got != "original" {
+				t.Fatalf("content changed to %q", got)
+			}
+		})
+	}
+}
+
 func TestImportPromptIdentityAndTombstoneOrdering(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("import-prompt-session", "engram", "/tmp"); err != nil {
