@@ -1020,6 +1020,34 @@ func TestPromptInboxIdentityDeletedPulled(t *testing.T) {
 	}
 }
 
+func TestPromptInboxIdentityDeletedPulledAgainWithoutSession(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("repeated-delete-inbox", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	first := `{"sync_id":"old-sync","session_id":"repeated-delete-inbox","source_inbox_id":"one","deleted":true}`
+	deletion := SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: "old-sync", Op: SyncOpDelete, Payload: first}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, deletion); err != nil {
+		t.Fatal(err)
+	}
+	deletion.Seq = 2
+	deletion.Payload = `{"sync_id":"old-sync","deleted":true}`
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, deletion); err != nil {
+		t.Fatal(err)
+	}
+	var sessionID, inboxID string
+	if err := s.DB().QueryRow(`SELECT session_id, source_inbox_id FROM prompt_tombstones WHERE sync_id = ?`, "old-sync").Scan(&sessionID, &inboxID); err != nil {
+		t.Fatal(err)
+	}
+	if sessionID != "repeated-delete-inbox" || inboxID != "one" {
+		t.Fatalf("repeated deletion lost identity: session=%q inbox=%q", sessionID, inboxID)
+	}
+	p := AddPromptParams{SessionID: sessionID, Project: "engram", Content: "same", SourceInboxID: inboxID}
+	if id, inserted, err := s.AddPromptWithResult(p); !errors.Is(err, ErrPromptInboxDeleted) || id != 0 || inserted {
+		t.Fatalf("local replay: %d %v %v", id, inserted, err)
+	}
+}
+
 func TestPromptInboxIdentityDeletedPulledBackfill(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("pulled-backfill-inbox", "engram", "/tmp"); err != nil {

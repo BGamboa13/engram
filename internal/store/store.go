@@ -9151,8 +9151,9 @@ func (s *Store) recordPromptTombstoneTx(tx *sql.Tx, syncID, sessionID string, pr
 	_, err := s.execHook(tx,
 		`INSERT INTO prompt_tombstones (sync_id, session_id, project, source_inbox_id, deleted_at)
          VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(sync_id) DO UPDATE SET session_id = excluded.session_id, project = excluded.project,
-             source_inbox_id = COALESCE(excluded.source_inbox_id, prompt_tombstones.source_inbox_id), deleted_at = excluded.deleted_at`,
+         ON CONFLICT(sync_id) DO UPDATE SET session_id = COALESCE(NULLIF(excluded.session_id, ''), prompt_tombstones.session_id),
+             project = excluded.project, source_inbox_id = COALESCE(excluded.source_inbox_id, prompt_tombstones.source_inbox_id),
+             deleted_at = excluded.deleted_at`,
 		syncID, sessionID, project, nullableString(inboxID), deletedAt,
 	)
 	return err
