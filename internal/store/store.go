@@ -5919,6 +5919,15 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 		if tombstone.SourceInboxID != "" && strings.TrimSpace(tombstone.SessionID) == "" {
 			return nil, fmt.Errorf("import prompt tombstone %q: session id is required for source inbox id", tombstone.SyncID)
 		}
+		// Validate before matching or removing prompts: the entire import must roll back on conflict.
+		var establishedSession, establishedInbox string
+		identityErr := tx.QueryRow(`SELECT ifnull(session_id, ''), ifnull(source_inbox_id, '') FROM prompt_tombstones WHERE sync_id = ?`, tombstone.SyncID).Scan(&establishedSession, &establishedInbox)
+		if identityErr != nil && !errors.Is(identityErr, sql.ErrNoRows) {
+			return nil, fmt.Errorf("import prompt tombstone %q: check identity: %w", tombstone.SyncID, identityErr)
+		}
+		if identityErr == nil && ((tombstone.SessionID != "" && establishedSession != "" && tombstone.SessionID != establishedSession) || (tombstone.SourceInboxID != "" && establishedInbox != "" && tombstone.SourceInboxID != establishedInbox)) {
+			return nil, fmt.Errorf("import prompt tombstone %q: %w", tombstone.SyncID, ErrPulledPromptIdentityInvalid)
+		}
 		rows, err := s.queryItHook(tx, `SELECT sync_id, session_id, ifnull(project, ''), ifnull(source_inbox_id, '') FROM user_prompts WHERE sync_id = ? OR (? != '' AND session_id = ? AND source_inbox_id = ?)`, tombstone.SyncID, tombstone.SourceInboxID, tombstone.SessionID, tombstone.SourceInboxID)
 		if err != nil {
 			return nil, fmt.Errorf("import prompt tombstone %q: load local prompts: %w", tombstone.SyncID, err)
@@ -9235,7 +9244,15 @@ func (s *Store) recordPromptTombstoneTx(tx *sql.Tx, syncID, sessionID string, pr
 		normalized, _ := NormalizeProject(strings.TrimSpace(*project))
 		project = nullableString(normalized)
 	}
-	_, err := s.execHook(tx,
+	var existingSession, existingInbox string
+	err := tx.QueryRow(`SELECT ifnull(session_id, ''), ifnull(source_inbox_id, '') FROM prompt_tombstones WHERE sync_id = ?`, syncID).Scan(&existingSession, &existingInbox)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil && ((sessionID != "" && existingSession != "" && sessionID != existingSession) || (inboxID != "" && existingInbox != "" && inboxID != existingInbox)) {
+		return fmt.Errorf("%w: prompt tombstone %q conflicts with established identity", ErrPulledPromptIdentityInvalid, syncID)
+	}
+	_, err = s.execHook(tx,
 		`INSERT INTO prompt_tombstones (sync_id, session_id, project, source_inbox_id, deleted_at)
          VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(sync_id) DO UPDATE SET session_id = COALESCE(NULLIF(excluded.session_id, ''), prompt_tombstones.session_id),
