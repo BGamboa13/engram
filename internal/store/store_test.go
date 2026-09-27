@@ -1171,6 +1171,47 @@ func TestPromptInboxIdentityDeletedPulledAgainWithoutSession(t *testing.T) {
 	}
 }
 
+func TestPromptSparseDeleteRetainsProjectAfterSessionRemoval(t *testing.T) {
+	s := newTestStore(t)
+	const sessionID = "sparse-project-session"
+	const syncID = "sparse-project-prompt"
+	if err := s.CreateSession(sessionID, "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	deletion := SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: syncID, Op: SyncOpDelete,
+		Payload: `{"sync_id":"sparse-project-prompt","session_id":"sparse-project-session","project":"engram","source_inbox_id":"one","deleted":true}`}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, deletion); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSession(sessionID); err != nil {
+		t.Fatal(err)
+	}
+	deletion.Seq = 2
+	deletion.Payload = `{"sync_id":"sparse-project-prompt","deleted":true}`
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, deletion); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := s.ExportProject("engram")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exported.PromptTombstones) != 1 || exported.PromptTombstones[0].SyncID != syncID ||
+		exported.PromptTombstones[0].SessionID != sessionID || exported.PromptTombstones[0].SourceInboxID != "one" ||
+		exported.PromptTombstones[0].Project == nil || *exported.PromptTombstones[0].Project != "engram" {
+		t.Fatalf("project export lost scoped tombstone: %+v", exported.PromptTombstones)
+	}
+	fresh := newTestStore(t)
+	if _, err := fresh.Import(exported); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.CreateSession(sessionID, "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if id, inserted, err := fresh.AddPromptWithResult(AddPromptParams{SessionID: sessionID, Project: "engram", Content: "stale", SourceInboxID: "one"}); !errors.Is(err, ErrPromptInboxDeleted) || id != 0 || inserted {
+		t.Fatalf("stale inbox replay: id=%d inserted=%v err=%v", id, inserted, err)
+	}
+}
+
 func TestPromptInboxIdentityDeletedPulledBackfill(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("pulled-backfill-inbox", "engram", "/tmp"); err != nil {
