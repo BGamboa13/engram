@@ -5871,13 +5871,23 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 		}
 		if p.SourceInboxID != "" {
 			var existingID int64
-			var existingSession, existingIdentity string
-			err := tx.QueryRow(`SELECT id, session_id, ifnull(source_inbox_id, '') FROM user_prompts WHERE sync_id = ? ORDER BY id DESC LIMIT 1`, syncID).Scan(&existingID, &existingSession, &existingIdentity)
+			var existingSession, existingIdentity, existingProject, sessionProject string
+			err := tx.QueryRow(`SELECT p.id, p.session_id, ifnull(p.source_inbox_id, ''), ifnull(p.project, ''), ifnull(s.project, '') FROM user_prompts p LEFT JOIN sessions s ON s.id = p.session_id WHERE p.sync_id = ? ORDER BY p.id DESC LIMIT 1`, syncID).Scan(&existingID, &existingSession, &existingIdentity, &existingProject, &sessionProject)
 			if err != nil && err != sql.ErrNoRows {
 				return nil, fmt.Errorf("import prompt %d: lookup identity: %w", p.ID, err)
 			}
 			if err == nil {
-				if existingSession != p.SessionID || (existingIdentity != "" && existingIdentity != p.SourceInboxID) {
+				localProject := strings.TrimSpace(existingProject)
+				incomingProject := strings.TrimSpace(p.Project)
+				if localProject == "" {
+					localProject = strings.TrimSpace(sessionProject)
+				}
+				if incomingProject == "" {
+					incomingProject = strings.TrimSpace(sessionProject)
+				}
+				localProject, _ = NormalizeProject(localProject)
+				incomingProject, _ = NormalizeProject(incomingProject)
+				if existingSession != p.SessionID || localProject != incomingProject || (existingIdentity != "" && existingIdentity != p.SourceInboxID) {
 					return nil, fmt.Errorf("import prompt %d: conflicting inbox identity", p.ID)
 				}
 				if existingIdentity == "" {

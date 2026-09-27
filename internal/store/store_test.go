@@ -7135,6 +7135,64 @@ func TestImportAdoptsLegacyPromptInboxIdentity(t *testing.T) {
 	}
 }
 
+func TestImportPromptInboxIdentityRequiresMatchingEffectiveProject(t *testing.T) {
+	for _, tc := range []struct {
+		name, localProject, incomingProject string
+		conflict                            bool
+	}{
+		{"different shared projects", "alpha", "beta", true},
+		{"same project", "alpha", "alpha", false},
+		{"normalized project", " Alpha ", "ALPHA", false},
+		{"canonical repeated separators", "Alpha--Project", "alpha-project", false},
+		{"legacy blank project inherits session", "", "alpha", false},
+		{"blank local inherits different session project", "", "beta", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			if err := s.CreateSession("shared-project-session", "alpha", "/tmp"); err != nil {
+				t.Fatal(err)
+			}
+			id, err := s.AddPrompt(AddPromptParams{SessionID: "shared-project-session", Project: "alpha", Content: "original"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.db.Exec(`UPDATE user_prompts SET project = ? WHERE id = ?`, tc.localProject, id); err != nil {
+				t.Fatal(err)
+			}
+			syncID := scalarString(t, s, `SELECT sync_id FROM user_prompts WHERE id = ?`, id)
+			_, err = s.Import(&ExportData{Prompts: []Prompt{{
+				SyncID:        syncID,
+				SessionID:     "shared-project-session",
+				Project:       tc.incomingProject,
+				SourceInboxID: "inbox-project",
+				Content:       "replacement",
+			}}})
+			if tc.conflict && err == nil {
+				t.Fatal("expected project conflict")
+			}
+			if !tc.conflict && err != nil {
+				t.Fatal(err)
+			}
+			wantIdentity := "inbox-project"
+			if tc.conflict {
+				wantIdentity = ""
+			}
+			if got := scalarString(t, s, `SELECT ifnull(source_inbox_id, '') FROM user_prompts WHERE id = ?`, id); got != wantIdentity {
+				t.Fatalf("identity = %q, want %q", got, wantIdentity)
+			}
+			if got := scalarString(t, s, `SELECT project FROM user_prompts WHERE id = ?`, id); got != tc.localProject {
+				t.Fatalf("project = %q, want %q", got, tc.localProject)
+			}
+			if got := scalarString(t, s, `SELECT content FROM user_prompts WHERE id = ?`, id); got != "original" {
+				t.Fatalf("content = %q, want original", got)
+			}
+			if got := scalarInt(t, s, `SELECT count(*) FROM user_prompts`); got != 1 {
+				t.Fatalf("row count = %d, want 1", got)
+			}
+		})
+	}
+}
+
 func TestImportRejectsConflictingPromptInboxIdentity(t *testing.T) {
 	for _, tc := range []struct {
 		name, localSession, localIdentity, incomingSession, incomingIdentity string
