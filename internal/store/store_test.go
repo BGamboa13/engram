@@ -1280,6 +1280,47 @@ func TestPulledSparsePromptDeleteSurvivesSessionRemoval(t *testing.T) {
 	}
 }
 
+func TestPulledSparsePromptDeleteAfterSessionRemoval(t *testing.T) {
+	s := newTestStore(t)
+	const sessionID = "removed-before-prompt-delete"
+	const syncID = "late-sparse-delete"
+	if err := s.CreateSession(sessionID, "alpha", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSession(sessionID); err != nil {
+		t.Fatal(err)
+	}
+	deletion := SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: syncID, Op: SyncOpDelete,
+		Payload: `{"sync_id":"late-sparse-delete","session_id":"removed-before-prompt-delete","source_inbox_id":"inbox","deleted":true}`}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, deletion); err != nil {
+		t.Fatalf("pulled delete after session removal: %v", err)
+	}
+	owner, err := s.ExportProject("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(owner.PromptTombstones) != 1 || owner.PromptTombstones[0].SyncID != syncID || owner.PromptTombstones[0].Project == nil || *owner.PromptTombstones[0].Project != "alpha" {
+		t.Fatalf("owner export lost late prompt delete: %+v", owner.PromptTombstones)
+	}
+	other, err := s.ExportProject("beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(other.PromptTombstones) != 0 {
+		t.Fatalf("late prompt delete leaked to other project: %+v", other.PromptTombstones)
+	}
+	fresh := newTestStore(t)
+	if _, err := fresh.Import(owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.CreateSession(sessionID, "alpha", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fresh.AddPromptWithResult(AddPromptParams{SessionID: sessionID, Project: "alpha", SourceInboxID: "inbox", Content: "replay"}); !errors.Is(err, ErrPromptInboxDeleted) {
+		t.Fatalf("restoration replay: %v", err)
+	}
+}
+
 func TestExportProjectLegacyPromptDeleteUsesSessionTombstone(t *testing.T) {
 	s := newTestStore(t)
 	const sessionID = "legacy-sparse-owner"
@@ -1301,8 +1342,44 @@ func TestExportProjectLegacyPromptDeleteUsesSessionTombstone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(owner.PromptTombstones) != 1 || owner.PromptTombstones[0].SyncID != syncID {
-		t.Fatalf("legacy prompt delete missing from owner export: %+v", owner.PromptTombstones)
+	if len(owner.PromptTombstones) != 1 || owner.PromptTombstones[0].SyncID != syncID || owner.PromptTombstones[0].Project == nil || *owner.PromptTombstones[0].Project != "alpha" {
+		t.Fatalf("legacy prompt delete missing resolved owner: %+v", owner.PromptTombstones)
+	}
+	fresh := newTestStore(t)
+	if _, err := fresh.Import(owner); err != nil {
+		t.Fatal(err)
+	}
+	reexported, err := fresh.ExportProject("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reexported.PromptTombstones) != 1 || reexported.PromptTombstones[0].SyncID != syncID || reexported.PromptTombstones[0].Project == nil || *reexported.PromptTombstones[0].Project != "alpha" {
+		t.Fatalf("roundtrip lost legacy prompt delete owner: %+v", reexported.PromptTombstones)
+	}
+	unscoped, err := s.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unscoped.PromptTombstones) != 1 || unscoped.PromptTombstones[0].Project == nil || *unscoped.PromptTombstones[0].Project != "alpha" {
+		t.Fatalf("full export lost legacy tombstone owner: %+v", unscoped.PromptTombstones)
+	}
+	fullRestore := newTestStore(t)
+	if _, err := fullRestore.Import(unscoped); err != nil {
+		t.Fatal(err)
+	}
+	fullOwner, err := fullRestore.ExportProject("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fullOwner.PromptTombstones) != 1 || fullOwner.PromptTombstones[0].SyncID != syncID || fullOwner.PromptTombstones[0].Project == nil || *fullOwner.PromptTombstones[0].Project != "alpha" {
+		t.Fatalf("full export roundtrip lost tombstone owner: %+v", fullOwner.PromptTombstones)
+	}
+	fullOther, err := fullRestore.ExportProject("beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fullOther.PromptTombstones) != 0 {
+		t.Fatalf("full export roundtrip leaked tombstone: %+v", fullOther.PromptTombstones)
 	}
 	other, err := s.ExportProject("beta")
 	if err != nil {
@@ -1495,6 +1572,13 @@ func TestImportLegacyEmptySessionTombstone(t *testing.T) {
 	}
 	if got := scalarInt(t, s, `SELECT count(*) FROM prompt_tombstones WHERE sync_id = ?`, "legacy-empty-session"); got != 1 {
 		t.Fatalf("legacy tombstone count = %d, want 1", got)
+	}
+	backup, err := s.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backup.PromptTombstones) != 1 || backup.PromptTombstones[0].Project == nil || *backup.PromptTombstones[0].Project != "" {
+		t.Fatalf("unowned legacy tombstone export: %+v", backup.PromptTombstones)
 	}
 }
 

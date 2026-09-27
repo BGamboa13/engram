@@ -5724,10 +5724,11 @@ func (s *Store) exportWithProjectScope(project string) (_ *ExportData, err error
 		return nil, err
 	}
 
-	tombstoneQuery := `SELECT t.sync_id, ifnull(t.session_id, ''), t.project, ifnull(t.source_inbox_id, ''), t.deleted_at FROM prompt_tombstones t`
+	tombstoneProject := `coalesce(nullif(t.project, ''), nullif(s.project, ''), (SELECT st.project FROM sync_delete_tombstones st WHERE st.entity = 'session' AND st.entity_key = t.session_id AND st.active = 1), '')`
+	tombstoneQuery := `SELECT t.sync_id, ifnull(t.session_id, ''), ` + tombstoneProject + `, ifnull(t.source_inbox_id, ''), t.deleted_at FROM prompt_tombstones t LEFT JOIN sessions s ON s.id = t.session_id`
 	tombstoneArgs := []any{}
 	if project != "" {
-		tombstoneQuery += ` LEFT JOIN sessions s ON s.id = t.session_id WHERE coalesce(nullif(t.project, ''), nullif(s.project, ''), (SELECT st.project FROM sync_delete_tombstones st WHERE st.entity = 'session' AND st.entity_key = t.session_id AND st.active = 1), '') = ?`
+		tombstoneQuery += ` WHERE ` + tombstoneProject + ` = ?`
 		tombstoneArgs = append(tombstoneArgs, project)
 	}
 	tombstoneQuery += ` ORDER BY t.sync_id`
