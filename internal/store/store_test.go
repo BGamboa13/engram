@@ -1548,8 +1548,8 @@ func TestImportRejectsInboxTombstoneWithoutSessionAtomically(t *testing.T) {
 		t.Run(fmt.Sprintf("session_%q", sessionID), func(t *testing.T) {
 			s := newTestStore(t)
 			backup := &ExportData{
-				Version: currentExportVersion,
-				Sessions: []Session{{ID: "partial-import-session", Project: "engram", Directory: "/tmp", StartedAt: Now()}},
+				Version:          currentExportVersion,
+				Sessions:         []Session{{ID: "partial-import-session", Project: "engram", Directory: "/tmp", StartedAt: Now()}},
 				PromptTombstones: []PromptTombstone{{SyncID: "invalid-inbox-delete", SessionID: sessionID, SourceInboxID: "inbox-1", DeletedAt: Now()}},
 			}
 			if _, err := s.Import(backup); err == nil || !strings.Contains(err.Error(), "invalid-inbox-delete") {
@@ -6385,6 +6385,48 @@ func TestApplyPulledPromptDeleteInvalidInboxIdentityQuarantinesAndContinues(t *t
 	}
 }
 
+func TestPulledPromptDeleteConflictingTombstoneQuarantines(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("owner", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateSession("other", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	first := SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: "fixed", Op: SyncOpDelete, Payload: `{"sync_id":"fixed","session_id":"owner","source_inbox_id":"key","deleted":true}`}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, first); err != nil {
+		t.Fatal(err)
+	}
+	for i, identity := range []string{`"session_id":"other","source_inbox_id":"key"`, `"session_id":"owner","source_inbox_id":"different"`} {
+		payload := fmt.Sprintf(`{"sync_id":"fixed",%s,"deleted":true}`, identity)
+		mutation := SyncMutation{Seq: int64(i + 2), Entity: SyncEntityPrompt, EntityKey: "fixed", Op: SyncOpDelete, Payload: payload}
+		if err := s.ApplyPulledMutation(DefaultSyncTargetKey, mutation); err != nil {
+			t.Fatalf("conflicting pull: %v", err)
+		}
+		if got := scalarString(t, s, `SELECT session_id || ':' || source_inbox_id FROM prompt_tombstones WHERE sync_id = 'fixed'`); got != "owner:key" {
+			t.Fatalf("identity changed: %s", got)
+		}
+		rows, err := s.ListDeferred(ListDeferredOptions{Status: "dead"})
+		if err != nil || len(rows) != i+1 || rows[i].PayloadRaw != payload || rows[i].ReasonCode != SyncPromptIdentityInvalidReasonCode || rows[i].RemoteSeq != mutation.Seq {
+			t.Fatalf("dead evidence=%+v, err=%v", rows, err)
+		}
+		state, err := s.GetSyncState(DefaultSyncTargetKey)
+		if err != nil || state.LastPulledSeq != mutation.Seq {
+			t.Fatalf("cursor=%+v, err=%v", state, err)
+		}
+	}
+	if _, _, err := s.AddPromptWithResult(AddPromptParams{SessionID: "owner", Project: "engram", Content: "replay", SourceInboxID: "key"}); !errors.Is(err, ErrPromptInboxDeleted) {
+		t.Fatalf("deleted key reused: %v", err)
+	}
+	legacy := SyncMutation{Seq: 4, Entity: SyncEntityPrompt, EntityKey: "legacy-idless", Op: SyncOpDelete, Payload: `{"sync_id":"legacy-idless","session_id":"owner","deleted":true}`}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, legacy); err != nil {
+		t.Fatalf("legacy delete: %v", err)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM prompt_tombstones WHERE sync_id = 'legacy-idless'`); got != 1 {
+		t.Fatalf("legacy tombstones=%d", got)
+	}
+}
+
 func TestApplyPulledPromptDeleteCreatesTombstoneAndRemovesPrompt(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("s-prompt", "engram", "/tmp/engram"); err != nil {
@@ -7402,10 +7444,10 @@ func TestImportRejectsNonOrphanedDanglingAndMissingSupersedingRelations(t *testi
 			destination := newTestStore(t)
 			project := "backup-project"
 			data := &ExportData{
-				Version: "0.2.0",
-				Sessions: []Session{{ID: "invalid-relation-session", Project: "backup-project", Directory: "/tmp/backup", StartedAt: "2026-01-01T00:00:00Z"}},
+				Version:      "0.2.0",
+				Sessions:     []Session{{ID: "invalid-relation-session", Project: "backup-project", Directory: "/tmp/backup", StartedAt: "2026-01-01T00:00:00Z"}},
 				Observations: []Observation{{SyncID: "obs-valid-endpoint", SessionID: "invalid-relation-session", Type: "note", Title: "valid", Content: "valid", Project: &project, Scope: "project", CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z"}},
-				Relations: []BackupRelation{{SyncID: "rel-invalid-endpoint", SourceID: "obs-valid-endpoint", TargetID: "obs-missing-endpoint", Relation: RelationRelated, JudgmentStatus: status, CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z"}},
+				Relations:    []BackupRelation{{SyncID: "rel-invalid-endpoint", SourceID: "obs-valid-endpoint", TargetID: "obs-missing-endpoint", Relation: RelationRelated, JudgmentStatus: status, CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z"}},
 			}
 			if _, err := destination.Import(data); err == nil || !strings.Contains(err.Error(), "relation endpoint") {
 				t.Fatalf("import dangling %s relation error = %v, want missing endpoint error", status, err)
@@ -7418,7 +7460,7 @@ func TestImportRejectsNonOrphanedDanglingAndMissingSupersedingRelations(t *testi
 	project := "backup-project"
 	missingSuperseding := "rel-not-in-backup"
 	data := &ExportData{
-		Version: "0.2.0",
+		Version:  "0.2.0",
 		Sessions: []Session{{ID: "missing-superseding-session", Project: "backup-project", Directory: "/tmp/backup", StartedAt: "2026-01-01T00:00:00Z"}},
 		Observations: []Observation{
 			{SyncID: "obs-superseding-source", SessionID: "missing-superseding-session", Type: "note", Title: "source", Content: "source", Project: &project, Scope: "project", CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z"},
@@ -7461,10 +7503,10 @@ func TestImportValidatesMissingSupersedingRelationForExistingRelation(t *testing
 	project := "backup-project"
 	missingSuperseding := "rel-missing-superseder"
 	data := &ExportData{
-		Version: "0.2.0",
-		Sessions: []Session{{ID: "rolled-back-session", Project: project, Directory: "/tmp/rollback", StartedAt: "2026-01-01T00:00:00Z"}},
+		Version:      "0.2.0",
+		Sessions:     []Session{{ID: "rolled-back-session", Project: project, Directory: "/tmp/rollback", StartedAt: "2026-01-01T00:00:00Z"}},
 		Observations: []Observation{{SyncID: "obs-rolled-back", SessionID: "rolled-back-session", Type: "note", Title: "rollback", Content: "rollback", Project: &project, Scope: "project", CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z"}},
-		Relations: []BackupRelation{{SyncID: "rel-existing-no-superseder", SourceID: source.SyncID, TargetID: target.SyncID, Relation: RelationRelated, JudgmentStatus: JudgmentStatusPending, SupersededByRelationSyncID: &missingSuperseding, CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z"}},
+		Relations:    []BackupRelation{{SyncID: "rel-existing-no-superseder", SourceID: source.SyncID, TargetID: target.SyncID, Relation: RelationRelated, JudgmentStatus: JudgmentStatusPending, SupersededByRelationSyncID: &missingSuperseding, CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z"}},
 	}
 	if _, err := destination.Import(data); err == nil || !strings.Contains(err.Error(), "superseding relation") {
 		t.Fatalf("import existing relation with missing superseder error = %v, want missing superseding relation error", err)
@@ -7930,6 +7972,72 @@ func TestImportRejectsConflictingPromptInboxIdentity(t *testing.T) {
 				t.Fatalf("content changed to %q", got)
 			}
 		})
+	}
+}
+
+func TestPromptTombstoneIdentityCannotRebind(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("original", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateSession("other", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	original := PromptTombstone{SyncID: "fixed", SessionID: "original", SourceInboxID: "key", DeletedAt: Now()}
+	if _, err := s.Import(&ExportData{PromptTombstones: []PromptTombstone{original}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, incoming := range []PromptTombstone{
+		{SyncID: "fixed", SessionID: "other", SourceInboxID: "key", DeletedAt: Now()},
+		{SyncID: "fixed", SessionID: "original", SourceInboxID: "different", DeletedAt: Now()},
+	} {
+		if _, err := s.Import(&ExportData{PromptTombstones: []PromptTombstone{incoming}}); !errors.Is(err, ErrPulledPromptIdentityInvalid) {
+			t.Fatalf("conflicting import error = %v", err)
+		}
+		if got := scalarString(t, s, `SELECT session_id || ':' || source_inbox_id FROM prompt_tombstones WHERE sync_id = 'fixed'`); got != "original:key" {
+			t.Fatalf("identity changed: %s", got)
+		}
+	}
+	if _, err := s.Import(&ExportData{PromptTombstones: []PromptTombstone{{SyncID: "fixed", DeletedAt: Now()}}}); err != nil {
+		t.Fatalf("sparse repeat: %v", err)
+	}
+	if _, err := s.Import(&ExportData{PromptTombstones: []PromptTombstone{{SyncID: "fixed", SessionID: "original", SourceInboxID: "key", DeletedAt: Now()}}}); err != nil {
+		t.Fatalf("same identity: %v", err)
+	}
+	if _, err := s.Import(&ExportData{PromptTombstones: []PromptTombstone{{SyncID: "legacy", DeletedAt: Now()}, {SyncID: "legacy", SessionID: "original", SourceInboxID: "later", DeletedAt: Now()}}}); err != nil {
+		t.Fatalf("legacy fill: %v", err)
+	}
+	if got := scalarString(t, s, `SELECT session_id || ':' || source_inbox_id FROM prompt_tombstones WHERE sync_id = 'legacy'`); got != "original:later" {
+		t.Fatalf("legacy fill = %s", got)
+	}
+}
+
+func TestImportConflictingTombstoneDoesNotDeleteMatchedPrompt(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("owner", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateSession("other", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Import(&ExportData{PromptTombstones: []PromptTombstone{{SyncID: "fixed", SessionID: "owner", SourceInboxID: "key", DeletedAt: Now()}}}); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.AddPrompt(AddPromptParams{SessionID: "other", Project: "engram", Content: "keep", SourceInboxID: "other-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE user_prompts SET sync_id = 'fixed' WHERE id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Import(&ExportData{PromptTombstones: []PromptTombstone{{SyncID: "fixed", SessionID: "other", SourceInboxID: "other-key", DeletedAt: Now()}}}); !errors.Is(err, ErrPulledPromptIdentityInvalid) {
+		t.Fatalf("conflicting matched import: %v", err)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM user_prompts WHERE id = ? AND content = 'keep'`, id); got != 1 {
+		t.Fatalf("matched prompt lost: %d", got)
+	}
+	if got := scalarString(t, s, `SELECT session_id || ':' || source_inbox_id FROM prompt_tombstones WHERE sync_id = 'fixed'`); got != "owner:key" {
+		t.Fatalf("identity changed: %s", got)
 	}
 }
 
