@@ -765,6 +765,164 @@ func TestAddObservationAdoptsUnownedLegacySessionProject(t *testing.T) {
 	}
 }
 
+func TestPromptInboxIdentityStore(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("inbox-session", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	p := AddPromptParams{SessionID: "inbox-session", Project: "engram", Content: "same", SourceInboxID: "inbox-1"}
+	first, inserted, err := s.AddPromptWithResult(p)
+	if err != nil || !inserted {
+		t.Fatalf("first: %d %v %v", first, inserted, err)
+	}
+	var before int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	again, inserted, err := s.AddPromptWithResult(p)
+	if err != nil || inserted || again != first {
+		t.Fatalf("replay: %d %v %v", again, inserted, err)
+	}
+	var after int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&after); err != nil || after != before {
+		t.Fatalf("mutations: %d -> %d: %v", before, after, err)
+	}
+	if err := s.CreateSession("other-session", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	other := p
+	other.SessionID = "other-session"
+	otherID, otherInserted, err := s.AddPromptWithResult(other)
+	if err != nil || !otherInserted || otherID == first {
+		t.Fatalf("same inbox ID in another session: %d %v %v", otherID, otherInserted, err)
+	}
+	p.SourceInboxID = "inbox-2"
+	second, inserted, err := s.AddPromptWithResult(p)
+	if err != nil || !inserted || second == first {
+		t.Fatalf("distinct: %d %v %v", second, inserted, err)
+	}
+	p.SourceInboxID = ""
+	third, err := s.AddPrompt(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fourth, err := s.AddPrompt(p)
+	if err != nil || fourth == third {
+		t.Fatalf("legacy: %d %d %v", third, fourth, err)
+	}
+}
+
+func TestPromptInboxIdentityStoreRetryReplaysCompetingWrite(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("retry-inbox", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	p := AddPromptParams{SessionID: "retry-inbox", Project: "engram", Content: "attempt", SourceInboxID: "inbox-1"}
+	competing, err := sql.Open("sqlite", storeDSN(filepath.Join(s.cfg.DataDir, "engram.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := competing.Close(); err != nil {
+			t.Errorf("close competing prompt database: %v", err)
+		}
+	}()
+
+	originalCommit := s.hooks.commit
+	attempts := 0
+	var competingID int64
+	s.hooks.commit = func(tx *sql.Tx) error {
+		attempts++
+		if attempts != 1 {
+			return originalCommit(tx)
+		}
+		var pending int
+		if err := tx.QueryRow(`SELECT count(*) FROM user_prompts WHERE session_id = ? AND source_inbox_id = ?`, p.SessionID, p.SourceInboxID).Scan(&pending); err != nil {
+			return err
+		}
+		if pending != 1 {
+			t.Fatalf("first attempt prompt count = %d, want 1", pending)
+		}
+		if err := tx.Rollback(); err != nil {
+			return err
+		}
+		res, err := competing.ExecContext(context.Background(),
+			`INSERT INTO user_prompts (sync_id, session_id, content, project, source_inbox_id) VALUES (?, ?, ?, ?, ?)`,
+			"competing-prompt", p.SessionID, "competing", p.Project, p.SourceInboxID)
+		if err != nil {
+			return err
+		}
+		competingID, err = res.LastInsertId()
+		if err != nil {
+			return err
+		}
+		return errors.New("database is locked")
+	}
+	t.Cleanup(func() { s.hooks.commit = originalCommit })
+
+	id, inserted, err := s.AddPromptWithResult(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 || id != competingID || inserted {
+		t.Fatalf("attempts=%d id=%d competingID=%d inserted=%t; want two attempts, competing ID and false", attempts, id, competingID, inserted)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM user_prompts WHERE session_id='retry-inbox' AND source_inbox_id='inbox-1'`); got != 1 {
+		t.Fatalf("persisted prompts = %d, want 1", got)
+	}
+}
+
+func TestPromptInboxIdentityStoreConcurrentReplay(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("concurrent-inbox", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	enrollTestProject(t, s, "engram")
+	const workers = 12
+	start := make(chan struct{})
+	type result struct {
+		id       int64
+		inserted bool
+		err      error
+	}
+	results := make(chan result, workers)
+	p := AddPromptParams{SessionID: "concurrent-inbox", Project: "engram", Content: "same", SourceInboxID: "shared"}
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start
+			id, inserted, err := s.AddPromptWithResult(p)
+			results <- result{id, inserted, err}
+		}()
+	}
+	close(start)
+	var first int64
+	var inserts int
+	for i := 0; i < workers; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if first == 0 {
+			first = r.id
+		} else if r.id != first {
+			t.Fatalf("concurrent replay returned %d, want %d", r.id, first)
+		}
+		if r.inserted {
+			inserts++
+		}
+	}
+	if inserts != 1 {
+		t.Fatalf("inserted %d times, want one", inserts)
+	}
+	var mutations int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = 'prompt'`).Scan(&mutations); err != nil {
+		t.Fatal(err)
+	}
+	if mutations != 1 {
+		t.Fatalf("prompt sync mutations = %d, want one", mutations)
+	}
+}
+
 func TestAddPromptAdoptsUnownedLegacySessionProject(t *testing.T) {
 	type legacySession struct{ id, project string }
 	s := newTestStoreWithNullableLegacySessions(t, legacySession{"null-session", "<NULL>"})
@@ -2636,15 +2794,17 @@ func TestNewMigratesLegacyUserPromptsSyncIDSchema(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	var syncID string
-	if err := s.db.QueryRow("SELECT sync_id FROM user_prompts WHERE content = ?", "legacy prompt").Scan(&syncID); err != nil {
-		t.Fatalf("query migrated prompt sync_id: %v", err)
+	var legacyID int64
+	var legacyContent, syncID string
+	var legacyInboxID sql.NullString
+	if err := s.db.QueryRow("SELECT id, content, sync_id, source_inbox_id FROM user_prompts WHERE session_id = ?", "s1").Scan(&legacyID, &legacyContent, &syncID, &legacyInboxID); err != nil {
+		t.Fatalf("query migrated legacy prompt: %v", err)
 	}
-	if syncID == "" {
-		t.Fatalf("expected migrated prompt sync_id to be backfilled")
+	if legacyID != 1 || legacyContent != "legacy prompt" || syncID == "" || legacyInboxID.Valid {
+		t.Fatalf("legacy prompt not preserved: id=%d content=%q sync_id=%q inbox_id=%v", legacyID, legacyContent, syncID, legacyInboxID)
 	}
 
-	var hasSyncIDColumn bool
+	var hasSyncIDColumn, hasInboxIDColumn bool
 	rows, err := s.db.Query("PRAGMA table_info(user_prompts)")
 	if err != nil {
 		t.Fatalf("query prompt columns: %v", err)
@@ -2657,20 +2817,24 @@ func TestNewMigratesLegacyUserPromptsSyncIDSchema(t *testing.T) {
 		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
 			t.Fatalf("scan prompt column: %v", err)
 		}
-		if name == "sync_id" {
+		switch name {
+		case "sync_id":
 			hasSyncIDColumn = true
-			break
+		case "source_inbox_id":
+			hasInboxIDColumn = true
 		}
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
+		if closeErr := rows.Close(); closeErr != nil {
+			t.Fatalf("iterate prompt columns: %v; close prompt columns: %v", err, closeErr)
+		}
 		t.Fatalf("iterate prompt columns: %v", err)
 	}
 	if err := rows.Close(); err != nil {
 		t.Fatalf("close prompt columns: %v", err)
 	}
-	if !hasSyncIDColumn {
-		t.Fatalf("expected user_prompts.sync_id column after migration")
+	if !hasSyncIDColumn || !hasInboxIDColumn {
+		t.Fatalf("expected sync_id and source_inbox_id columns after migration: sync=%v inbox=%v", hasSyncIDColumn, hasInboxIDColumn)
 	}
 
 	var indexName string
@@ -2679,6 +2843,39 @@ func TestNewMigratesLegacyUserPromptsSyncIDSchema(t *testing.T) {
 	}
 	if indexName != "idx_prompts_sync_id" {
 		t.Fatalf("expected idx_prompts_sync_id to exist, got %q", indexName)
+	}
+
+	var indexSQL string
+	if err := s.db.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_prompts_source_inbox' AND tbl_name = 'user_prompts'").Scan(&indexSQL); err != nil {
+		t.Fatalf("query prompt inbox index: %v", err)
+	}
+	if !strings.Contains(indexSQL, "UNIQUE INDEX") || !strings.Contains(indexSQL, "(session_id, source_inbox_id)") || !strings.Contains(indexSQL, "WHERE source_inbox_id IS NOT NULL") {
+		t.Fatalf("expected unique partial session/inbox index, got %q", indexSQL)
+	}
+
+	params := AddPromptParams{SessionID: "s1", Content: "new prompt", Project: "engram", SourceInboxID: "inbox-1"}
+	promptID, inserted, err := s.AddPromptWithResult(params)
+	if err != nil || !inserted || promptID <= 0 || promptID == legacyID {
+		t.Fatalf("insert inbox prompt: id=%d inserted=%v err=%v", promptID, inserted, err)
+	}
+	params.Content = "replayed prompt must not replace original"
+	replayID, inserted, err := s.AddPromptWithResult(params)
+	if err != nil || inserted || replayID != promptID {
+		t.Fatalf("replay inbox prompt: id=%d inserted=%v err=%v; original id=%d", replayID, inserted, err, promptID)
+	}
+	var count int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM user_prompts WHERE session_id = ?", "s1").Scan(&count); err != nil {
+		t.Fatalf("count prompts after replay: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected legacy and new prompt only, got %d", count)
+	}
+	var storedContent, storedSyncID string
+	if err := s.db.QueryRow("SELECT content, sync_id FROM user_prompts WHERE id = ?", legacyID).Scan(&storedContent, &storedSyncID); err != nil {
+		t.Fatalf("query legacy prompt after replay: %v", err)
+	}
+	if storedContent != legacyContent || storedSyncID != syncID {
+		t.Fatalf("legacy prompt changed after replay: content=%q sync_id=%q", storedContent, storedSyncID)
 	}
 }
 
