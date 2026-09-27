@@ -812,6 +812,265 @@ func TestPromptInboxIdentityStore(t *testing.T) {
 	}
 }
 
+func TestPromptInboxIdentitySyncRoundTrip(t *testing.T) {
+	source := newTestStore(t)
+	remote := newTestStore(t)
+	if err := source.CreateSession("sync-inbox", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	sessionBackup, err := source.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := remote.Import(sessionBackup); err != nil {
+		t.Fatal(err)
+	}
+	enrollTestProject(t, remote, "engram")
+	enrollTestProject(t, source, "engram")
+	for _, id := range []string{"a", "b"} {
+		if _, _, err := source.AddPromptWithResult(AddPromptParams{SessionID: "sync-inbox", Project: "engram", Content: "same", SourceInboxID: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := source.DB().Query(`SELECT payload FROM sync_mutations WHERE entity = ? AND op = ? ORDER BY seq`, SyncEntityPrompt, SyncOpUpsert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Errorf("close prompt sync mutations: %v", err)
+		}
+	}()
+	nextSeq := int64(1)
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			t.Fatal(err)
+		}
+		var wire syncPromptPayload
+		if err := json.Unmarshal([]byte(payload), &wire); err != nil {
+			t.Fatal(err)
+		}
+		if wire.SourceInboxID == "" {
+			t.Fatalf("missing inbox identity: %s", payload)
+		}
+		if err := remote.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: nextSeq, Entity: SyncEntityPrompt, EntityKey: wire.SyncID, Op: SyncOpUpsert, Payload: payload}); err != nil {
+			t.Fatal(err)
+		}
+		nextSeq++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := remote.DB().QueryRow(`SELECT count(*) FROM user_prompts WHERE session_id = ? AND source_inbox_id IN ('a','b')`, "sync-inbox").Scan(&count); err != nil || count != 2 {
+		t.Fatalf("remote identities: %d %v", count, err)
+	}
+	before, inserted, err := remote.AddPromptWithResult(AddPromptParams{SessionID: "sync-inbox", Project: "engram", Content: "same", SourceInboxID: "a"})
+	if err != nil || inserted || before == 0 {
+		t.Fatalf("replay: %d %v %v", before, inserted, err)
+	}
+}
+
+func TestPromptInboxIdentitySyncConflict(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("conflict-session", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.AddPromptWithResult(AddPromptParams{SessionID: "conflict-session", Project: "engram", Content: "original", SourceInboxID: "shared"}); err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"sync_id":"different-sync-id","session_id":"conflict-session","content":"replacement","source_inbox_id":"shared"}`
+	err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: "different-sync-id", Op: SyncOpUpsert, Payload: payload})
+	if err == nil || !strings.Contains(err.Error(), "prompt inbox identity conflict") {
+		t.Fatalf("expected explicit identity conflict, got %v", err)
+	}
+}
+
+func TestPromptInboxIdentityRejectsSameSyncIDRebinding(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("rebind-session", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := s.AddPromptWithResult(AddPromptParams{SessionID: "rebind-session", Project: "engram", Content: "original", SourceInboxID: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var syncID string
+	if err := s.DB().QueryRow(`SELECT sync_id FROM user_prompts WHERE id = ?`, id).Scan(&syncID); err != nil {
+		t.Fatal(err)
+	}
+	payload := fmt.Sprintf(`{"sync_id":%q,"session_id":"rebind-session","content":"replacement","source_inbox_id":"b"}`, syncID)
+	err = s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: syncID, Op: SyncOpUpsert, Payload: payload})
+	if err == nil || !strings.Contains(err.Error(), "prompt inbox identity conflict") {
+		t.Fatalf("expected explicit identity conflict, got %v", err)
+	}
+	var identity, content string
+	if err := s.DB().QueryRow(`SELECT source_inbox_id, content FROM user_prompts WHERE id = ?`, id).Scan(&identity, &content); err != nil {
+		t.Fatal(err)
+	}
+	if identity != "a" || content != "original" {
+		t.Fatalf("prompt after rejected rebind = (%q, %q)", identity, content)
+	}
+	var cursor int64
+	if err := s.DB().QueryRow(`SELECT last_pulled_seq FROM sync_state WHERE target_key = ?`, DefaultSyncTargetKey).Scan(&cursor); err != nil {
+		t.Fatal(err)
+	}
+	if cursor != 0 {
+		t.Fatalf("pull cursor after rejected rebind = %d", cursor)
+	}
+	got, inserted, err := s.AddPromptWithResult(AddPromptParams{SessionID: "rebind-session", Project: "engram", Content: "replay", SourceInboxID: "a"})
+	if err != nil || inserted || got != id {
+		t.Fatalf("replay A = (%d, %v, %v), want (%d, false, nil)", got, inserted, err, id)
+	}
+}
+
+func TestPromptInboxIdentityRejectsSessionMove(t *testing.T) {
+	for _, tc := range []struct {
+		name, incomingID string
+	}{
+		{name: "same ID", incomingID: "a"},
+		{name: "omitted ID"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			for _, session := range []string{"s1", "s2"} {
+				if err := s.CreateSession(session, "engram", "/tmp"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			id, _, err := s.AddPromptWithResult(AddPromptParams{SessionID: "s1", Project: "engram", Content: "original", SourceInboxID: "a"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var syncID string
+			if err := s.DB().QueryRow(`SELECT sync_id FROM user_prompts WHERE id = ?`, id).Scan(&syncID); err != nil {
+				t.Fatal(err)
+			}
+			payload := fmt.Sprintf(`{"sync_id":%q,"session_id":"s2","content":"replacement","source_inbox_id":%q}`, syncID, tc.incomingID)
+			err = s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: syncID, Op: SyncOpUpsert, Payload: payload})
+			if err == nil || !strings.Contains(err.Error(), "prompt inbox identity conflict") {
+				t.Fatalf("expected explicit identity conflict, got %v", err)
+			}
+			var session, identity, content string
+			if err := s.DB().QueryRow(`SELECT session_id, source_inbox_id, content FROM user_prompts WHERE id = ?`, id).Scan(&session, &identity, &content); err != nil {
+				t.Fatal(err)
+			}
+			if session != "s1" || identity != "a" || content != "original" {
+				t.Fatalf("prompt after rejected move = (%q, %q, %q)", session, identity, content)
+			}
+			var cursor int64
+			if err := s.DB().QueryRow(`SELECT last_pulled_seq FROM sync_state WHERE target_key = ?`, DefaultSyncTargetKey).Scan(&cursor); err != nil {
+				t.Fatal(err)
+			}
+			if cursor != 0 {
+				t.Fatalf("pull cursor after rejected move = %d", cursor)
+			}
+			got, inserted, err := s.AddPromptWithResult(AddPromptParams{SessionID: "s1", Project: "engram", Content: "replay", SourceInboxID: "a"})
+			if err != nil || inserted || got != id {
+				t.Fatalf("replay s1/a = (%d, %v, %v), want (%d, false, nil)", got, inserted, err, id)
+			}
+		})
+	}
+}
+
+func TestPromptInboxIdentityLegacyUpgradeAndMove(t *testing.T) {
+	s := newTestStore(t)
+	for _, session := range []string{"legacy-s1", "legacy-s2"} {
+		if err := s.CreateSession(session, "engram", "/tmp"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	id, _, err := s.AddPromptWithResult(AddPromptParams{SessionID: "legacy-s1", Project: "engram", Content: "original"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var syncID string
+	if err := s.DB().QueryRow(`SELECT sync_id FROM user_prompts WHERE id = ?`, id).Scan(&syncID); err != nil {
+		t.Fatal(err)
+	}
+	for seq, payload := range []string{
+		fmt.Sprintf(`{"sync_id":%q,"session_id":"legacy-s2","content":"moved"}`, syncID),
+		fmt.Sprintf(`{"sync_id":%q,"session_id":"legacy-s2","content":"upgraded","source_inbox_id":"a"}`, syncID),
+	} {
+		if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: int64(seq + 1), Entity: SyncEntityPrompt, EntityKey: syncID, Op: SyncOpUpsert, Payload: payload}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var session, identity, content string
+	if err := s.DB().QueryRow(`SELECT session_id, source_inbox_id, content FROM user_prompts WHERE id = ?`, id).Scan(&session, &identity, &content); err != nil {
+		t.Fatal(err)
+	}
+	if session != "legacy-s2" || identity != "a" || content != "upgraded" {
+		t.Fatalf("upgraded prompt = (%q, %q, %q)", session, identity, content)
+	}
+	got, inserted, err := s.AddPromptWithResult(AddPromptParams{SessionID: "legacy-s2", Project: "engram", Content: "replay", SourceInboxID: "a"})
+	if err != nil || inserted || got != id {
+		t.Fatalf("replay upgraded identity = (%d, %v, %v), want (%d, false, nil)", got, inserted, err, id)
+	}
+}
+
+func TestPromptInboxIdentityLegacyPayload(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("legacy-inbox", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.AddPromptWithResult(AddPromptParams{SessionID: "legacy-inbox", Project: "engram", Content: "original", SourceInboxID: "retained"}); err != nil {
+		t.Fatal(err)
+	}
+	var syncID string
+	if err := s.DB().QueryRow(`SELECT sync_id FROM user_prompts WHERE session_id = ?`, "legacy-inbox").Scan(&syncID); err != nil {
+		t.Fatal(err)
+	}
+	payload := fmt.Sprintf(`{"sync_id":%q,"session_id":"legacy-inbox","content":"updated"}`, syncID)
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: syncID, Op: SyncOpUpsert, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	var identity string
+	if err := s.DB().QueryRow(`SELECT source_inbox_id FROM user_prompts WHERE sync_id = ?`, syncID).Scan(&identity); err != nil || identity != "retained" {
+		t.Fatalf("legacy update identity = %q, err %v", identity, err)
+	}
+	id, inserted, err := s.AddPromptWithResult(AddPromptParams{SessionID: "legacy-inbox", Project: "engram", Content: "replay", SourceInboxID: "retained"})
+	if err != nil || inserted || id == 0 {
+		t.Fatalf("replay = %d, %v, %v", id, inserted, err)
+	}
+}
+
+func TestPromptInboxIdentityExportImport(t *testing.T) {
+	source := newTestStore(t)
+	if err := source.CreateSession("export-inbox", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"a", "b"} {
+		if _, _, err := source.AddPromptWithResult(AddPromptParams{SessionID: "export-inbox", Project: "engram", Content: "same", SourceInboxID: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := source.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Prompts) != 2 || data.Prompts[0].SourceInboxID != "a" || data.Prompts[1].SourceInboxID != "b" {
+		t.Fatalf("export identities: %+v", data.Prompts)
+	}
+	restored := newTestStore(t)
+	if _, err := restored.Import(data); err != nil {
+		t.Fatal(err)
+	}
+	var before int
+	if err := restored.DB().QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	_, inserted, err := restored.AddPromptWithResult(AddPromptParams{SessionID: "export-inbox", Project: "engram", Content: "same", SourceInboxID: "a"})
+	if err != nil || inserted {
+		t.Fatalf("restored replay: %v %v", inserted, err)
+	}
+	var after int
+	if err := restored.DB().QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&after); err != nil || after != before {
+		t.Fatalf("mutation count %d -> %d: %v", before, after, err)
+	}
+}
+
 func TestPromptInboxIdentityStoreRetryReplaysCompetingWrite(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("retry-inbox", "engram", "/tmp"); err != nil {
@@ -4568,6 +4827,58 @@ func TestUpgradeRepairDryRunAndApply(t *testing.T) {
 		}
 	})
 
+	t.Run("legacy prompt repair retains authoritative inbox identity", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, localID, suppliedID, wantID string
+		}{
+			{"missing identity", "local-inbox", "", "local-inbox"},
+			{"supplied identity", "local-inbox", "supplied-inbox", "supplied-inbox"},
+			{"no local identity", "", "", ""},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newTestStore(t)
+				if err := s.CreateSession("prompt-repair-session", "prompt-repair-project", "/tmp/prompt-repair"); err != nil {
+					t.Fatalf("create session: %v", err)
+				}
+				if _, err := s.AddPrompt(AddPromptParams{SessionID: "prompt-repair-session", Project: "prompt-repair-project", Content: "authoritative content", SourceInboxID: tc.localID}); err != nil {
+					t.Fatalf("add prompt: %v", err)
+				}
+				if err := s.EnrollProject("prompt-repair-project"); err != nil {
+					t.Fatalf("enroll project: %v", err)
+				}
+				var syncID string
+				if err := s.db.QueryRow(`SELECT sync_id FROM user_prompts WHERE session_id = ?`, "prompt-repair-session").Scan(&syncID); err != nil {
+					t.Fatalf("lookup prompt sync ID: %v", err)
+				}
+				legacy, err := json.Marshal(syncPromptPayload{SyncID: syncID, SessionID: "prompt-repair-session", SourceInboxID: tc.suppliedID})
+				if err != nil {
+					t.Fatalf("encode legacy payload: %v", err)
+				}
+				if _, err := s.execHook(s.db, `UPDATE sync_mutations SET payload = ? WHERE entity = ? AND entity_key = ? AND op = ?`, string(legacy), SyncEntityPrompt, syncID, SyncOpUpsert); err != nil {
+					t.Fatalf("seed legacy mutation: %v", err)
+				}
+				report, err := s.RepairCloudUpgrade("prompt-repair-project", true)
+				if err != nil {
+					t.Fatalf("repair legacy prompt: %v", err)
+				}
+				if !report.Applied {
+					t.Fatalf("expected applied repair, got %+v", report)
+				}
+				var payload string
+				if err := s.db.QueryRow(`SELECT payload FROM sync_mutations WHERE entity = ? AND entity_key = ? AND op = ? ORDER BY seq DESC LIMIT 1`, SyncEntityPrompt, syncID, SyncOpUpsert).Scan(&payload); err != nil {
+					t.Fatalf("load repaired payload: %v", err)
+				}
+				var repaired syncPromptPayload
+				if err := decodeSyncPayload([]byte(payload), &repaired); err != nil {
+					t.Fatalf("decode repaired payload: %v", err)
+				}
+				if repaired.SourceInboxID != tc.wantID || repaired.Content != "authoritative content" {
+					t.Fatalf("repaired prompt = %+v, want inbox ID %q and authoritative content", repaired, tc.wantID)
+				}
+			})
+		}
+	})
+
 	t.Run("legacy relation mutation payload is repaired from authoritative local relation", func(t *testing.T) {
 		s := newTestStore(t)
 		if err := s.CreateSession("legacy-rel-s1", "legacy-rel-proj", "/tmp/legacy-rel"); err != nil {
@@ -6854,6 +7165,131 @@ func TestImportOlderObservationDoesNotResurrectLocalDeletion(t *testing.T) {
 	}
 	if result.ObservationsImported != 0 || result.ObservationsSkippedStale != 1 || scalarInt(t, s, `SELECT count(*) FROM observations WHERE sync_id = ? AND deleted_at IS NOT NULL`, "import-delete-observation") != 1 {
 		t.Fatalf("older active snapshot changed local deletion: result=%+v", result)
+	}
+}
+
+func TestImportAdoptsLegacyPromptInboxIdentity(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("adopt-session", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.AddPrompt(AddPromptParams{SessionID: "adopt-session", Project: "engram", Content: "original"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncID := scalarString(t, s, `SELECT sync_id FROM user_prompts WHERE id = ?`, id)
+	incoming := &ExportData{Prompts: []Prompt{{SyncID: syncID, SessionID: "adopt-session", SourceInboxID: "inbox-a", Content: "imported", Project: "engram"}}}
+	result, err := s.Import(incoming)
+	if err != nil || result.PromptsImported != 0 {
+		t.Fatalf("import = %+v, %v", result, err)
+	}
+	if got := scalarString(t, s, `SELECT ifnull(source_inbox_id, '') FROM user_prompts WHERE id = ?`, id); got != "inbox-a" {
+		t.Fatalf("identity = %q", got)
+	}
+	replayed, inserted, err := s.AddPromptWithResult(AddPromptParams{SessionID: "adopt-session", Project: "engram", Content: "replay", SourceInboxID: "inbox-a"})
+	if err != nil || inserted || replayed != id {
+		t.Fatalf("replay = %d, %v, %v; original %d", replayed, inserted, err, id)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM user_prompts WHERE session_id = ?`, "adopt-session"); got != 1 {
+		t.Fatalf("prompt count = %d", got)
+	}
+}
+
+func TestImportPromptInboxIdentityRequiresMatchingEffectiveProject(t *testing.T) {
+	for _, tc := range []struct {
+		name, localProject, incomingProject string
+		conflict                            bool
+	}{
+		{"different shared projects", "alpha", "beta", true},
+		{"same project", "alpha", "alpha", false},
+		{"normalized project", " Alpha ", "ALPHA", false},
+		{"canonical repeated separators", "Alpha--Project", "alpha-project", false},
+		{"legacy blank project inherits session", "", "alpha", false},
+		{"blank local inherits different session project", "", "beta", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			if err := s.CreateSession("shared-project-session", "alpha", "/tmp"); err != nil {
+				t.Fatal(err)
+			}
+			id, err := s.AddPrompt(AddPromptParams{SessionID: "shared-project-session", Project: "alpha", Content: "original"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.db.Exec(`UPDATE user_prompts SET project = ? WHERE id = ?`, tc.localProject, id); err != nil {
+				t.Fatal(err)
+			}
+			syncID := scalarString(t, s, `SELECT sync_id FROM user_prompts WHERE id = ?`, id)
+			_, err = s.Import(&ExportData{Prompts: []Prompt{{
+				SyncID:        syncID,
+				SessionID:     "shared-project-session",
+				Project:       tc.incomingProject,
+				SourceInboxID: "inbox-project",
+				Content:       "replacement",
+			}}})
+			if tc.conflict && err == nil {
+				t.Fatal("expected project conflict")
+			}
+			if !tc.conflict && err != nil {
+				t.Fatal(err)
+			}
+			wantIdentity := "inbox-project"
+			if tc.conflict {
+				wantIdentity = ""
+			}
+			if got := scalarString(t, s, `SELECT ifnull(source_inbox_id, '') FROM user_prompts WHERE id = ?`, id); got != wantIdentity {
+				t.Fatalf("identity = %q, want %q", got, wantIdentity)
+			}
+			if got := scalarString(t, s, `SELECT project FROM user_prompts WHERE id = ?`, id); got != tc.localProject {
+				t.Fatalf("project = %q, want %q", got, tc.localProject)
+			}
+			if got := scalarString(t, s, `SELECT content FROM user_prompts WHERE id = ?`, id); got != "original" {
+				t.Fatalf("content = %q, want original", got)
+			}
+			if got := scalarInt(t, s, `SELECT count(*) FROM user_prompts`); got != 1 {
+				t.Fatalf("row count = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestImportRejectsConflictingPromptInboxIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name, localSession, localIdentity, incomingSession, incomingIdentity string
+		owner                                                                bool
+	}{
+		{"established", "s1", "original", "s1", "different", false},
+		{"cross session", "s1", "", "s2", "incoming", false},
+		{"already owned", "s1", "", "s1", "incoming", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			for _, session := range []string{"s1", "s2"} {
+				if err := s.CreateSession(session, "engram", "/tmp"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			id, _, err := s.AddPromptWithResult(AddPromptParams{SessionID: tc.localSession, Project: "engram", Content: "original", SourceInboxID: tc.localIdentity})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.owner {
+				if _, _, err := s.AddPromptWithResult(AddPromptParams{SessionID: "s1", Project: "engram", Content: "owner", SourceInboxID: tc.incomingIdentity}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			syncID := scalarString(t, s, `SELECT sync_id FROM user_prompts WHERE id = ?`, id)
+			_, err = s.Import(&ExportData{Prompts: []Prompt{{SyncID: syncID, SessionID: tc.incomingSession, SourceInboxID: tc.incomingIdentity, Content: "replacement", Project: "engram"}}})
+			if err == nil {
+				t.Fatal("expected identity conflict")
+			}
+			if got := scalarString(t, s, `SELECT ifnull(source_inbox_id, '') FROM user_prompts WHERE id = ?`, id); got != tc.localIdentity {
+				t.Fatalf("identity changed to %q", got)
+			}
+			if got := scalarString(t, s, `SELECT content FROM user_prompts WHERE id = ?`, id); got != "original" {
+				t.Fatalf("content changed to %q", got)
+			}
+		})
 	}
 }
 
