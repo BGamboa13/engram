@@ -11015,7 +11015,11 @@ func (s *Store) applyPromptUpsertTx(tx *sql.Tx, payload syncPromptPayload) error
 			return err
 		}
 	}
-	err = tx.QueryRow(`SELECT id FROM user_prompts WHERE sync_id = ? ORDER BY id DESC LIMIT 1`, payload.SyncID).Scan(&existingID)
+	var existingSessionID, existingSourceInboxID string
+	err = tx.QueryRow(`SELECT id, session_id, ifnull(source_inbox_id, '') FROM user_prompts WHERE sync_id = ? ORDER BY id DESC LIMIT 1`, payload.SyncID).Scan(&existingID, &existingSessionID, &existingSourceInboxID)
+	if err == nil && existingSourceInboxID != "" && (existingSessionID != payload.SessionID || (payload.SourceInboxID != "" && existingSourceInboxID != payload.SourceInboxID)) {
+		return fmt.Errorf("prompt inbox identity conflict for sync ID %q: existing session %q and inbox ID %q, received session %q and inbox ID %q", payload.SyncID, existingSessionID, existingSourceInboxID, payload.SessionID, payload.SourceInboxID)
+	}
 	if err == sql.ErrNoRows {
 		if strings.TrimSpace(payload.CreatedAt) == "" {
 			_, err = s.execHook(tx,
