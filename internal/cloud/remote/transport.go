@@ -360,6 +360,64 @@ func NewMutationTransport(baseURL, token string) (*MutationTransport, error) {
 	}, nil
 }
 
+// RegisterSessionAuthority registers a session under its owner project.
+func (mt *MutationTransport) RegisterSessionAuthority(sessionID, ownerProject string) error {
+	return mt.postProvenance("register session authority", "session-authorities", struct {
+		SessionID string `json:"session_id"`
+		Project   string `json:"project"`
+	}{sessionID, ownerProject})
+}
+
+// ClaimPromptPair binds a source inbox to a prompt sync identity.
+func (mt *MutationTransport) ClaimPromptPair(sessionID, sourceInboxID, syncID, ownerProject, promptProject string) error {
+	return mt.postProvenance("claim prompt pair", "prompt-pair-claims", struct {
+		SessionID     string `json:"session_id"`
+		SourceInboxID string `json:"source_inbox_id"`
+		SyncID        string `json:"sync_id"`
+		OwnerProject  string `json:"owner_project"`
+		Project       string `json:"project"`
+	}{sessionID, sourceInboxID, syncID, ownerProject, promptProject})
+}
+
+func (mt *MutationTransport) postProvenance(operation, path string, payload any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("cloud: marshal %s: %w", operation, err)
+	}
+	req, err := http.NewRequest(http.MethodPost, mt.baseURL+"/sync/"+path, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("cloud: build %s request: %w", operation, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	mt.setAuthorization(req)
+	resp, err := mt.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("cloud: %s: %w", operation, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		response, _ := io.ReadAll(resp.Body)
+		return newProvenanceHTTPStatusError(operation, resp.StatusCode, response)
+	}
+	var result struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || result.Status != "ok" {
+		return fmt.Errorf("cloud: invalid %s response", operation)
+	}
+	return nil
+}
+
+// Recognize only the claim route's explicit authority code; retain the existing
+// mutation 404 mapping for absent routes and every other response.
+func newProvenanceHTTPStatusError(operation string, status int, body []byte) error {
+	parsed := newHTTPStatusError(operation, status, body).(*HTTPStatusError)
+	if status == http.StatusNotFound && parsed.ErrorCode == "session_authority_unavailable" && operation == "claim prompt pair" {
+		return parsed
+	}
+	return newMutationHTTPStatusError(operation, status, body)
+}
+
 func (mt *MutationTransport) setAuthorization(req *http.Request) {
 	if mt.token != "" {
 		req.Header.Set("Authorization", "Bearer "+mt.token)
