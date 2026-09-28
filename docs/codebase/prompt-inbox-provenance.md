@@ -1,6 +1,6 @@
 # RFC: authenticated prompt inbox provenance before remote deletion
 
-**Status: proposed contract, not implemented.** This RFC defines the minimum non-cryptographic authority needed before #1464 can enter the merge queue. It does not change current sync behavior. The baseline is tracker `313f5269`; the review thread on #1464 records the hold. #1240 is separate.
+**Status: proposed end-to-end contract; session registration and pair-claim storage implemented, server admission not implemented.** This RFC defines the minimum non-cryptographic authority needed before #1464 can enter the merge queue. It does not change current sync behavior. The baseline is tracker `313f5269`; the review thread on #1464 records the hold. #1240 is separate.
 
 ## Decision in one minute
 
@@ -44,4 +44,4 @@ Each PR is at most **400 authored diff lines**, includes its own tests/docs with
 
 ## Limitations
 
-This contract does not select transport route names, schema/migration details, pending retry UX, or a cryptographic offline issuer. Those require implementation design and tests before code changes; none may turn chunk/import history into authority. The current cloud behavior does **not** enforce this RFC.
+Remaining transport route names, pending retry UX, and any cryptographic offline issuer still require design and tests; none may turn chunk/import history into authority. Session registration and its storage schema exist. Cloud storage now supports explicit immutable prompt pair claims against registered sessions, without deriving claims from chunks or prompt history. `ClaimPromptPair` assumes its caller has authenticated the actor and checked both project grants; it does not perform authorization. No HTTP route, verified delete admission, or client handshake is implemented yet. The current cloud behavior does **not** enforce this RFC.

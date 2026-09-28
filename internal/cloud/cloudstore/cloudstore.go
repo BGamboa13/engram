@@ -772,6 +772,15 @@ func (cs *CloudStore) migrate(ctx context.Context) error {
 			registered_by TEXT NOT NULL,
 			registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
+		`CREATE TABLE IF NOT EXISTS cloud_prompt_pair_claims (
+			session_id TEXT NOT NULL REFERENCES cloud_session_authority(session_id),
+			source_inbox_id TEXT NOT NULL,
+			sync_id TEXT NOT NULL UNIQUE,
+			prompt_project TEXT NOT NULL,
+			claimed_by TEXT NOT NULL,
+			claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (session_id, source_inbox_id)
+		)`,
 		`CREATE TABLE IF NOT EXISTS cloud_project_sessions (
 			project_name TEXT NOT NULL,
 			session_id TEXT NOT NULL,
