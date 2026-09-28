@@ -7850,7 +7850,7 @@ func TestImportOlderObservationDoesNotResurrectLocalDeletion(t *testing.T) {
 	}
 }
 
-func TestImportAdoptionRefreshesPendingPromptMutation(t *testing.T) {
+func TestImportAdoptionAppendsCanonicalPromptMutation(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("adoption-pending", "engram", "/tmp"); err != nil {
 		t.Fatal(err)
@@ -7868,11 +7868,74 @@ func TestImportAdoptionRefreshesPendingPromptMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := scalarInt(t, s, `SELECT count(*) FROM sync_mutations WHERE entity = ? AND entity_key = ?`, SyncEntityPrompt, syncID); got != before {
-		t.Fatalf("mutation count = %d, want %d", got, before)
+	if got := scalarInt(t, s, `SELECT count(*) FROM sync_mutations WHERE entity = ? AND entity_key = ?`, SyncEntityPrompt, syncID); got != before+1 {
+		t.Fatalf("mutation count = %d, want %d", got, before+1)
+	}
+	if got := scalarString(t, s, `SELECT ifnull(json_extract(payload, '$.source_inbox_id'), '') FROM sync_mutations WHERE entity = ? AND entity_key = ? ORDER BY seq ASC LIMIT 1`, SyncEntityPrompt, syncID); got != "" {
+		t.Fatalf("original mutation identity changed to %q", got)
 	}
 	if got := scalarString(t, s, `SELECT json_extract(payload, '$.source_inbox_id') FROM sync_mutations WHERE entity = ? AND entity_key = ? AND op = ? AND disposition = 'pending' ORDER BY seq DESC LIMIT 1`, SyncEntityPrompt, syncID, SyncOpUpsert); got != "adopted" {
 		t.Fatalf("pending identity = %q", got)
+	}
+}
+
+func TestImportAdoptionKeepsFollowUpAfterOriginalAck(t *testing.T) {
+	for _, ackBefore := range []bool{true, false} {
+		t.Run(fmt.Sprintf("ack before import=%t", ackBefore), func(t *testing.T) {
+			s := newTestStore(t)
+			if err := s.CreateSession("adoption-ack", "engram", "/tmp"); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.EnrollProject("engram"); err != nil {
+				t.Fatal(err)
+			}
+			id, err := s.AddPrompt(AddPromptParams{SessionID: "adoption-ack", Project: "engram", Content: "canonical"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			syncID := scalarString(t, s, `SELECT sync_id FROM user_prompts WHERE id = ?`, id)
+			var originalSeq int64
+			if err := s.db.QueryRow(`SELECT seq FROM sync_mutations WHERE entity = ? AND entity_key = ?`, SyncEntityPrompt, syncID).Scan(&originalSeq); err != nil {
+				t.Fatal(err)
+			}
+			// This seq models the immutable outbound request copied before import.
+			if ackBefore {
+				if err := s.AckSyncMutationSeqs(DefaultSyncTargetKey, []int64{originalSeq}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err = s.Import(&ExportData{Prompts: []Prompt{{SyncID: syncID, SessionID: "adoption-ack", Project: "engram", Content: "untrusted incoming", SourceInboxID: "adopted"}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ackBefore {
+				if err := s.AckSyncMutationSeqs(DefaultSyncTargetKey, []int64{originalSeq}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := scalarInt(t, s, `SELECT count(*) FROM sync_mutations WHERE entity = ? AND entity_key = ? AND disposition = 'pending' AND seq > ? AND json_extract(payload, '$.source_inbox_id') = 'adopted' AND json_extract(payload, '$.content') = 'canonical'`, SyncEntityPrompt, syncID, originalSeq); got != 1 {
+				t.Fatalf("canonical follow-up pending = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestImportAdoptionWithoutEnrollmentDoesNotEnqueue(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("adoption-unenrolled", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.AddPrompt(AddPromptParams{SessionID: "adoption-unenrolled", Project: "engram", Content: "canonical"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncID := scalarString(t, s, `SELECT sync_id FROM user_prompts WHERE id = ?`, id)
+	before := scalarInt(t, s, `SELECT count(*) FROM sync_mutations WHERE entity = ? AND entity_key = ?`, SyncEntityPrompt, syncID)
+	if _, err := s.Import(&ExportData{Prompts: []Prompt{{SyncID: syncID, SessionID: "adoption-unenrolled", Project: "engram", SourceInboxID: "adopted"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM sync_mutations WHERE entity = ? AND entity_key = ?`, SyncEntityPrompt, syncID); got != before {
+		t.Fatalf("mutation count = %d, want %d", got, before)
 	}
 }
 

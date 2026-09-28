@@ -6049,10 +6049,23 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 					if err != nil || updated != 1 {
 						return nil, fmt.Errorf("import prompt %d: inbox identity already owned: %v", p.ID, err)
 					}
-					if _, err := s.execHook(tx, `UPDATE sync_mutations SET payload = json_set(payload, '$.source_inbox_id', ?)
-						WHERE entity = ? AND entity_key = ? AND op = ? AND source = ? AND disposition = 'pending' AND acked_at IS NULL`,
-						p.SourceInboxID, SyncEntityPrompt, syncID, SyncOpUpsert, SyncSourceLocal); err != nil {
-						return nil, fmt.Errorf("import prompt %d: refresh pending identity: %w", p.ID, err)
+					var canonical syncPromptPayload
+					var persistedProject sql.NullString
+					if err := tx.QueryRow(`SELECT sync_id, session_id, content, project, created_at, source_inbox_id FROM user_prompts WHERE id = ?`, existingID).Scan(&canonical.SyncID, &canonical.SessionID, &canonical.Content, &persistedProject, &canonical.CreatedAt, &canonical.SourceInboxID); err != nil {
+						return nil, fmt.Errorf("import prompt %d: read adopted prompt: %w", p.ID, err)
+					}
+					canonical.Project = nullableString(localProject)
+					if persistedProject.Valid && strings.TrimSpace(persistedProject.String) != "" {
+						canonical.Project = nullableString(persistedProject.String)
+					}
+					enrolled, err := isProjectEnrolledTx(tx, localProject)
+					if err != nil {
+						return nil, fmt.Errorf("import prompt %d: check enrollment: %w", p.ID, err)
+					}
+					if enrolled {
+						if err := s.enqueueSyncMutationTx(tx, SyncEntityPrompt, syncID, SyncOpUpsert, canonical); err != nil {
+							return nil, fmt.Errorf("import prompt %d: enqueue adopted identity: %w", p.ID, err)
+						}
 					}
 				}
 			}
