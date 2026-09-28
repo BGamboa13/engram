@@ -54,15 +54,18 @@ func (s *CloudServer) handleRegisterSessionAuthority(w http.ResponseWriter, r *h
 		http.Error(w, "project is required", http.StatusBadRequest)
 		return
 	}
+	principal, hasPrincipal := PrincipalFromContext(r.Context())
+	usablePrincipal := hasPrincipal && strings.TrimSpace(principal.ID) != ""
+	if !usablePrincipal && s.auth == nil {
+		http.Error(w, "authentication unavailable", http.StatusUnauthorized)
+		return
+	}
 	if !s.authorizeProjectScope(r.Context(), w, project) {
 		return
 	}
 	actor := "legacy:authenticated"
-	if principal, ok := PrincipalFromContext(r.Context()); ok && strings.TrimSpace(principal.ID) != "" {
+	if usablePrincipal {
 		actor = strings.TrimSpace(principal.ID)
-	} else if s.auth == nil {
-		http.Error(w, "authentication unavailable", http.StatusUnauthorized)
-		return
 	}
 	registrar, ok := s.store.(sessionAuthorityRegistrar)
 	if !ok {

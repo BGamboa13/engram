@@ -82,12 +82,17 @@ func TestSessionAuthorityProjectPolicy(t *testing.T) {
 	if w.Code != 200 || st.project != "alpha/foo" || st.calls != 1 {
 		t.Fatalf("status=%d project=%q calls=%d body=%q", w.Code, st.project, st.calls, w.Body.String())
 	}
-	insecureStore := &authorityTestStore{}
-	insecure := New(insecureStore, nil, 0)
-	w = httptest.NewRecorder()
-	insecure.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/sync/session-authorities", strings.NewReader(`{"session_id":"s","project":"alpha"}`)))
-	if w.Code != 401 || insecureStore.calls != 0 {
-		t.Fatalf("insecure registration status=%d calls=%d body=%q", w.Code, insecureStore.calls, w.Body.String())
+	for _, project := range []string{"alpha", "beta"} {
+		t.Run("insecure "+project, func(t *testing.T) {
+			insecureStore := &authorityTestStore{}
+			insecure := New(insecureStore, nil, 0, WithProjectAuthorizer(legacy))
+			w := httptest.NewRecorder()
+			body := `{"session_id":"s","project":"` + project + `"}`
+			insecure.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/sync/session-authorities", strings.NewReader(body)))
+			if w.Code != 401 || insecureStore.calls != 0 {
+				t.Fatalf("insecure registration status=%d calls=%d body=%q", w.Code, insecureStore.calls, w.Body.String())
+			}
+		})
 	}
 }
 
