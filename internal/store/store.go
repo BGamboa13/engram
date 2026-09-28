@@ -1206,7 +1206,8 @@ func (s *Store) migrate() error {
 			started_at TEXT NOT NULL DEFAULT (datetime('now')),
 			ended_at   TEXT,
 			summary    TEXT,
-			runtime_lease_expires_at TEXT
+			runtime_lease_expires_at TEXT,
+			local_creation_project TEXT
 		);
 		CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
 
@@ -1387,6 +1388,9 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.addColumnIfNotExists("sessions", "runtime_lease_expires_at", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfNotExists("sessions", "local_creation_project", "TEXT"); err != nil {
 		return err
 	}
 	// Legacy rows remain unclassified unless their persisted identity proves a
@@ -2911,6 +2915,21 @@ func normalizeFTSSQL(ddl string) string {
 }
 
 // ─── Sessions ────────────────────────────────────────────────────────────────
+
+// LocalSessionProvenance returns the persisted owner and whether this store
+// independently created the session. An unknown or absent row is never eligible
+// for automatic cloud registration; project ownership alone is not proof.
+func (s *Store) LocalSessionProvenance(id string) (owner string, eligible bool, err error) {
+	var creationProject sql.NullString
+	err = s.db.QueryRow(`SELECT ifnull(project,''), local_creation_project FROM sessions WHERE id=?`, id).Scan(&owner, &creationProject)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return owner, creationProject.Valid && creationProject.String != "" && owner == creationProject.String, nil
+}
 
 func (s *Store) CreateSession(id, project, directory string) error {
 	return s.CreateSessionWithOwnershipMode(id, project, directory, SessionOwnershipShared)
@@ -8869,26 +8888,26 @@ func (s *Store) createSessionTx(tx *sql.Tx, id, project, directory, mode string)
 		return err
 	}
 	_, err := s.execHook(tx,
-		`INSERT INTO sessions (id, project, ownership_mode, directory, started_at) VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO sessions (id, project, ownership_mode, directory, started_at, local_creation_project) VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   project   = CASE WHEN ifnull(trim(sessions.project, ?), '') = '' THEN excluded.project ELSE sessions.project END,
 		   ownership_mode = CASE WHEN ifnull(trim(sessions.ownership_mode, ?), '') = '' THEN excluded.ownership_mode ELSE sessions.ownership_mode END,
 		   directory = CASE WHEN trim(sessions.directory, ?) = '' THEN excluded.directory ELSE sessions.directory END`,
-		id, project, mode, directory, Now(), sqlWhitespaceTrimSet, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet,
+		id, project, mode, directory, Now(), project, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet,
 	)
 	return err
 }
 
 func (s *Store) startSessionTx(tx *sql.Tx, id, project, directory, mode string) error {
 	result, err := s.execHook(tx,
-		`INSERT INTO sessions (id, project, ownership_mode, directory, started_at, runtime_lease_expires_at) VALUES (?, ?, ?, ?, ?, datetime('now', ?))
+		`INSERT INTO sessions (id, project, ownership_mode, directory, started_at, runtime_lease_expires_at, local_creation_project) VALUES (?, ?, ?, ?, ?, datetime('now', ?), ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   project   = CASE WHEN ifnull(trim(sessions.project, ?), '') = '' THEN excluded.project ELSE sessions.project END,
 		   ownership_mode = CASE WHEN ifnull(trim(sessions.ownership_mode, ?), '') = '' THEN excluded.ownership_mode ELSE sessions.ownership_mode END,
 		   directory = CASE WHEN trim(sessions.directory, ?) = '' THEN excluded.directory ELSE sessions.directory END,
 		   runtime_lease_expires_at = excluded.runtime_lease_expires_at
 		 WHERE sessions.ended_at IS NULL`,
-		id, project, mode, directory, Now(), runtimeSessionLeaseDuration, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet,
+		id, project, mode, directory, Now(), runtimeSessionLeaseDuration, project, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet,
 	)
 	if err != nil {
 		return err

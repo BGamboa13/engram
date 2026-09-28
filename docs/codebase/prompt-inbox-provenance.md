@@ -1,6 +1,6 @@
 # RFC: authenticated prompt inbox provenance before remote deletion
 
-**Status: proposed end-to-end contract; session registration and pair-claim storage implemented, server admission not implemented.** This RFC defines the minimum non-cryptographic authority needed before #1464 can enter the merge queue. It does not change current sync behavior. The baseline is tracker `313f5269`; the review thread on #1464 records the hold. #1240 is separate.
+**Status: proposed end-to-end contract; cloud registration, pair-claim storage and admission routes exist; local origin marking is implemented, but no client handshake or verified delete gate exists.** This RFC defines the minimum non-cryptographic authority needed before #1464 can enter the merge queue. It does not change current sync behavior. The baseline is tracker `313f5269`; the review thread on #1464 records the hold. #1240 is separate.
 
 ## Decision in one minute
 
@@ -8,7 +8,7 @@ Local SQLite remains authoritative for local writes; cloud is a replication boun
 
 This is a server-enforced authorization contract, not a new inference rule based on `project = session.project`. Legitimate beta prompts under alpha sessions must remain possible.
 
-## Authority and lifecycle (proposed surfaces, not existing routes)
+## Authority and lifecycle (registration and claim routes exist; delete gate pending)
 
 | Step | Required authority and durable effect |
 | --- | --- |
@@ -16,7 +16,7 @@ This is a server-enforced authorization contract, not a new inference rule based
 | Claim prompt pair | For a beta prompt referencing an alpha session, the claimant must hold authorization for **both** alpha and beta at claim time. Registration must already be verified. An authorized claim durably binds `(session_id, source_inbox_id)` to `(sync_id, beta)`; matching replay is idempotent and any competing sync ID or project is a conflict. Claims cannot bootstrap registration or be inferred from a beta upsert. Same-project claims still require session-owner and prompt-project authority; no special weaker bootstrap. |
 | Apply verified delete | A delete may reserve or replay a remote pair only against the existing verified binding, with beta authorization for the mutation. It need not require renewed alpha authorization: alpha consent was checked at the original claim. Validate sync ID, session ID, inbox ID and beta project against that binding. A beta-only writer cannot create or change the claim, even by sending an upsert followed by a delete; an alpha-only writer cannot claim/delete beta. |
 
-Registration and claim are explicit server admission operations/protocol surfaces to design, **not names of implemented endpoints**. Atomic uniqueness and conflict checks must survive concurrent retries. Authentication means server-verified principal and project grants, not fields supplied in the payload; no cryptographic offline capability is assumed. Revocation after a verified claim does not erase that historical binding, but current beta mutation authorization remains necessary. Idless legacy prompts remain pair-less and must not acquire a source inbox binding through inference.
+Registration and claim are explicit authenticated server operations (`POST /sync/session-authorities` and `POST /sync/prompt-pair-claims`); the verified-delete gate and client handshake remain pending. Atomic uniqueness and conflict checks must survive concurrent retries. Authentication means server-verified principal and project grants, not fields supplied in the payload; no cryptographic offline capability is assumed. Revocation after a verified claim does not erase that historical binding, but current beta mutation authorization remains necessary. Idless legacy prompts remain pair-less and must not acquire a source inbox binding through inference.
 
 ## Unverified deletes and compatibility
 
@@ -44,4 +44,4 @@ Each PR is at most **400 authored diff lines**, includes its own tests/docs with
 
 ## Limitations
 
-Remaining transport route names, pending retry UX, and any cryptographic offline issuer still require design and tests; none may turn chunk/import history into authority. Session registration and its storage schema exist. Cloud storage now supports explicit immutable prompt pair claims against registered sessions, without deriving claims from chunks or prompt history. `ClaimPromptPair` assumes its caller has authenticated the actor and checked both project grants; it does not perform authorization. No HTTP route, verified delete admission, or client handshake is implemented yet. The current cloud behavior does **not** enforce this RFC.
+Pending retry UX and any cryptographic offline issuer still require design and tests; none may turn chunk/import history into authority. Session registration and its storage schema exist. SQLite records `local_creation_project` only on newly inserted CreateSession/StartSession rows. NULL means unknown/unverified for pre-migration, imported, rescued and remotely created sessions. A pulled upsert into a locally created session preserves its existing marker. Eligibility requires the current owner to match that stored creation owner exactly; identity repair preserves the nullable value. A store read returns current owner and local eligibility, not cloud authority. Cloud storage supports explicit immutable prompt pair claims against registered sessions, without deriving claims from chunks or prompt history. `ClaimPromptPair` assumes its caller has authenticated the actor and checked both project grants; it does not perform authorization. Authenticated registration and pair-claim routes exist; no verified delete admission or client handshake is implemented yet. The current cloud behavior does **not** enforce this RFC.
