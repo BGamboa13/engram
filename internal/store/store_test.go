@@ -1423,6 +1423,42 @@ func TestPulledSparsePromptDeletePrefersLivePromptProject(t *testing.T) {
 	}
 }
 
+func TestPulledSparsePromptDeleteRetainsOwnTombstoneProjectWhileSessionLives(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("cross-owner", "alpha", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	const syncID = "cross-project-repeat"
+	for _, mutation := range []SyncMutation{
+		{Seq: 1, Entity: SyncEntityPrompt, EntityKey: syncID, Op: SyncOpUpsert, Payload: `{"sync_id":"cross-project-repeat","session_id":"cross-owner","project":"beta","content":"cross","source_inbox_id":"inbox"}`},
+		{Seq: 2, Entity: SyncEntityPrompt, EntityKey: syncID, Op: SyncOpDelete, Payload: `{"sync_id":"cross-project-repeat","deleted":true}`},
+		{Seq: 3, Entity: SyncEntityPrompt, EntityKey: syncID, Op: SyncOpDelete, Payload: `{"sync_id":"cross-project-repeat","session_id":"cross-owner","deleted":true}`},
+	} {
+		if err := s.ApplyPulledMutation(DefaultSyncTargetKey, mutation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state, err := s.GetSyncState(DefaultSyncTargetKey)
+	if err != nil || state.LastPulledSeq != 3 {
+		t.Fatalf("cursor=%+v, err=%v", state, err)
+	}
+	dead, err := s.ListDeferred(ListDeferredOptions{Status: "dead"})
+	if err != nil || len(dead) != 0 {
+		t.Fatalf("dead letters=%+v, err=%v", dead, err)
+	}
+	if got := scalarString(t, s, `SELECT project FROM prompt_tombstones WHERE sync_id = 'cross-project-repeat'`); got != "beta" {
+		t.Fatalf("tombstone project=%q", got)
+	}
+	beta, err := s.ExportProject("beta")
+	if err != nil || len(beta.PromptTombstones) != 1 || beta.PromptTombstones[0].SyncID != syncID {
+		t.Fatalf("beta export=%+v, err=%v", beta, err)
+	}
+	alpha, err := s.ExportProject("alpha")
+	if err != nil || len(alpha.PromptTombstones) != 0 {
+		t.Fatalf("alpha export=%+v, err=%v", alpha, err)
+	}
+}
+
 func TestPulledPromptDeleteQuarantinesInboxWithoutSession(t *testing.T) {
 	for _, session := range []string{"", " \t "} {
 		t.Run(fmt.Sprintf("session_%q", session), func(t *testing.T) {
