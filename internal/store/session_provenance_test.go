@@ -42,6 +42,14 @@ func TestLocalSessionProvenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("remote", "alpha", false)
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{
+		Seq: 2, Entity: SyncEntitySession, EntityKey: "new", Op: SyncOpUpsert,
+		Payload: `{"id":"new","project":"alpha","directory":"/work","started_at":"2025-01-01 00:00:00"}`,
+		Source:  SyncSourceRemote, Project: "alpha",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	check("new", "alpha", true)
 	for _, id := range []string{"imported", "pulled", "backup", "remote"} {
 		check(id, "alpha", false)
 		if err := s.CreateSession(id, "alpha", "/work"); err != nil {
@@ -67,6 +75,9 @@ func TestLocalSessionProvenanceMigration(t *testing.T) {
 	if _, err := s.DB().Exec(`ALTER TABLE sessions DROP COLUMN local_creation_project`); err != nil {
 		t.Fatal(err)
 	}
+	if _, _, err := s.LocalSessionProvenance("legacy"); err == nil {
+		t.Fatal("missing provenance column did not fail closed")
+	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +85,11 @@ func TestLocalSessionProvenanceMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	owner, eligible, err := s.LocalSessionProvenance("legacy")
 	if err != nil || owner != "alpha" || eligible {
 		t.Fatalf("migration: %q %v %v", owner, eligible, err)
