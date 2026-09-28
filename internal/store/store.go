@@ -1254,6 +1254,9 @@ func (s *Store) migrate() error {
 				id         INTEGER PRIMARY KEY AUTOINCREMENT,
 				sync_id    TEXT,
 				source_inbox_id TEXT,
+				local_creation_session_id TEXT,
+				local_creation_inbox_id TEXT,
+				local_creation_project TEXT,
 				session_id TEXT    NOT NULL,
 			content    TEXT    NOT NULL,
 			project    TEXT,
@@ -1409,6 +1412,11 @@ func (s *Store) migrate() error {
 	}
 	if err := s.addColumnIfNotExists("user_prompts", "source_inbox_id", "TEXT"); err != nil {
 		return err
+	}
+	for _, column := range []string{"local_creation_session_id", "local_creation_inbox_id", "local_creation_project"} {
+		if err := s.addColumnIfNotExists("user_prompts", column, "TEXT"); err != nil {
+			return err
+		}
 	}
 	if err := s.addColumnIfNotExists("prompt_tombstones", "source_inbox_id", "TEXT"); err != nil {
 		return err
@@ -3854,12 +3862,17 @@ func (s *Store) AddPromptWithResult(p AddPromptParams) (int64, bool, error) {
 			}
 		}
 		syncID := newSyncID("prompt")
-		query := `INSERT INTO user_prompts (sync_id, session_id, content, project, source_inbox_id) VALUES (?, ?, ?, ?, ?)`
+		query := `INSERT INTO user_prompts (sync_id, session_id, content, project, source_inbox_id, local_creation_session_id, local_creation_inbox_id, local_creation_project) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 		if p.SourceInboxID != "" {
 			query += ` ON CONFLICT(session_id, source_inbox_id) WHERE source_inbox_id IS NOT NULL DO NOTHING`
 		}
+		var creationSession, creationProject any
+		if p.SourceInboxID != "" {
+			creationSession, creationProject = p.SessionID, nullableString(p.Project)
+		}
 		res, err := s.execHook(tx, query,
-			syncID, p.SessionID, content, nullableString(p.Project), nullableString(p.SourceInboxID))
+			syncID, p.SessionID, content, nullableString(p.Project), nullableString(p.SourceInboxID),
+			creationSession, nullableString(p.SourceInboxID), creationProject)
 		if err != nil {
 			return err
 		}
@@ -3897,6 +3910,38 @@ func (s *Store) AddPromptWithResult(p AddPromptParams) (int64, bool, error) {
 		return 0, false, err
 	}
 	return promptID, inserted, nil
+}
+
+// LocalPromptCreationIdentity returns a live locally inserted keyed identity by sync ID.
+// Unknown, ambiguous and mismatched identities fail closed; deleted rows have no fallback.
+func (s *Store) LocalPromptCreationIdentity(syncID string) (session, inbox, project string, eligible bool, err error) {
+	if syncID == "" {
+		return "", "", "", false, nil
+	}
+	rows, err := s.db.Query(`SELECT local_creation_session_id, local_creation_inbox_id, local_creation_project,
+		ifnull(session_id,''), ifnull(source_inbox_id,''), ifnull(project,'') FROM user_prompts WHERE sync_id=? LIMIT 2`, syncID)
+	if err != nil {
+		return "", "", "", false, err
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		return "", "", "", false, rows.Err()
+	}
+	var originalSession, originalInbox, originalProject sql.NullString
+	if err := rows.Scan(&originalSession, &originalInbox, &originalProject, &session, &inbox, &project); err != nil {
+		return "", "", "", false, err
+	}
+	if rows.Next() {
+		return "", "", "", false, nil
+	}
+	if err := rows.Err(); err != nil {
+		return "", "", "", false, err
+	}
+	if originalSession.String == "" || originalInbox.String == "" || originalProject.String == "" ||
+		originalSession.String != session || originalInbox.String != inbox || originalProject.String != project {
+		return "", "", "", false, nil
+	}
+	return session, inbox, project, true, nil
 }
 
 func (s *Store) AddPromptIfMissing(p AddPromptParams) (int64, bool, error) {
