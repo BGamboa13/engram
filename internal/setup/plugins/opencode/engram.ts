@@ -895,8 +895,11 @@ async function withSystemStrings(system: V2SystemPart[], run: (texts: string[]) 
   })
 }
 
+// V2 `Tool.Result.content` is `string | Content[]`; `subagent` returns a string.
 function v2ToolResultText(result: any): string {
-  const text = Array.isArray(result?.content)
+  const text = typeof result?.content === "string"
+    ? result.content
+    : Array.isArray(result?.content)
     ? result.content.filter((part: any) => part?.type === "text").map((part: any) => part.text ?? "").join("\n")
     : ""
   return text || (result?.output === undefined ? "" : JSON.stringify(result.output))

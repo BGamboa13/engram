@@ -301,6 +301,24 @@ test("V2 tool hooks bind Engram writes to the root session and capture subagent 
   ])
 })
 
+test("V2 tool hook captures subagent output returned as string content", async (t) => {
+  const runtime = await setupV2(t, { sessions: new Map([["ses_root", sessionInfo("ses_root")]]) })
+  const output = "Subagent finished: the rendered transcript arrives as a plain string."
+  await runtime.hooks.get("tool.execute.after")({
+    tool: "subagent",
+    sessionID: "ses_root",
+    agent: "build",
+    messageID: "msg_3",
+    id: "call_3",
+    input: {},
+    status: "completed",
+    result: { content: output, output: { ignored: true } },
+  })
+  assert.deepEqual(runtime.posts("/observations/passive").map(({ body }) => body), [
+    { session_id: "ses_root", content: output, project: "engram", source: "task-complete" },
+  ])
+})
+
 test("V2 tool hook rejects Engram writes without an authoritative session", async (t) => {
   const runtime = await setupV2(t)
   const call = { tool: "engram_mem_save", sessionID: "ses_missing", input: {} }
