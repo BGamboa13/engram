@@ -917,6 +917,24 @@ function v1SessionEvent(event: any, directory: string): any {
   return undefined
 }
 
+// The V2 event stream ends or throws when the server restarts; reconnect with
+// a bounded doubling delay that resets once events flow again.
+const V2_EVENT_RETRY_MIN_MS = 50
+const V2_EVENT_RETRY_MAX_MS = 5000
+
+function delayUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve()
+    const done = () => {
+      clearTimeout(timer)
+      signal.removeEventListener("abort", done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    signal.addEventListener("abort", done, { once: true })
+  })
+}
+
 async function setupEngramV2(ctx: V2Context): Promise<() => Promise<void>> {
   const hooks: Record<string, any> = await Engram({
     directory: ctx.location.directory,
@@ -977,16 +995,26 @@ async function setupEngramV2(ctx: V2Context): Promise<() => Promise<void>> {
       await hooks["tool.execute.after"]({ tool, sessionID: call.sessionID, callID: call.id }, output)
     }))
 
-    const events = ctx.event.subscribe({ signal: abort.signal })
     listening = (async () => {
-      try {
-        for await (const event of events) {
-          if (abort.signal.aborted) break
-          const translated = v1SessionEvent(event, ctx.location.directory)
-          if (translated) await hooks.event({ event: translated }).catch(() => {})
+      let retryMs = V2_EVENT_RETRY_MIN_MS
+      while (!abort.signal.aborted) {
+        try {
+          for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
+            if (abort.signal.aborted) break
+            retryMs = V2_EVENT_RETRY_MIN_MS
+            try {
+              const translated = v1SessionEvent(event, ctx.location.directory)
+              if (translated) await hooks.event({ event: translated })
+            } catch {
+              // One failing event must not stop lifecycle tracking.
+            }
+          }
+        } catch {
+          // Events missed while disconnected are lost; hooks still bind sessions lazily.
         }
-      } catch {
-        // Stream failure loses lifecycle events; hooks still bind sessions lazily.
+        if (abort.signal.aborted) break
+        await delayUnlessAborted(retryMs, abort.signal)
+        retryMs = Math.min(retryMs * 2, V2_EVENT_RETRY_MAX_MS)
       }
     })()
   } catch (cause) {

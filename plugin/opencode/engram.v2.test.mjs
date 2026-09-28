@@ -19,20 +19,31 @@ function httpResponse(data) {
 }
 
 // Minimal OpenCode V2 event stream. emit() resolves once the plugin asks for
-// the next event, which proves the previous one was fully handled.
+// the next event, which proves the previous one was fully handled. end() and
+// fail() interrupt only the current subscription, like a server restart.
 function eventStream() {
   const queued = []
   let waiting
+  let waitingReject
   let pulled
   let closed = false
+  let interrupt
   const subscriptions = []
+  const settle = (result) => {
+    const resolve = waiting
+    const reject = waitingReject
+    waiting = undefined
+    waitingReject = undefined
+    if (result instanceof Error) reject(result)
+    else resolve(result)
+  }
   return {
     subscriptions,
     subscribe(options) {
       subscriptions.push(options)
       options?.signal?.addEventListener("abort", () => {
         closed = true
-        waiting?.({ value: undefined, done: true })
+        if (waiting) settle({ value: undefined, done: true })
       })
       return {
         [Symbol.asyncIterator]() {
@@ -40,9 +51,17 @@ function eventStream() {
             next() {
               pulled?.()
               pulled = undefined
+              if (interrupt) {
+                const result = interrupt
+                interrupt = undefined
+                return result instanceof Error ? Promise.reject(result) : Promise.resolve(result)
+              }
               if (queued.length > 0) return Promise.resolve({ value: queued.shift(), done: false })
               if (closed) return Promise.resolve({ value: undefined, done: true })
-              return new Promise((resolve) => { waiting = resolve })
+              return new Promise((resolve, reject) => {
+                waiting = resolve
+                waitingReject = reject
+              })
             },
             async return() {
               closed = true
@@ -54,15 +73,37 @@ function eventStream() {
     },
     emit(event) {
       const handled = new Promise((resolve) => { pulled = resolve })
-      if (waiting) {
-        const resolve = waiting
-        waiting = undefined
-        resolve({ value: event, done: false })
-      } else {
-        queued.push(event)
-      }
+      if (waiting) settle({ value: event, done: false })
+      else queued.push(event)
       return handled
     },
+    end() {
+      const result = { value: undefined, done: true }
+      if (waiting) settle(result)
+      else interrupt = result
+    },
+    fail(error) {
+      if (waiting) settle(error)
+      else interrupt = error
+    },
+    closeForever() {
+      closed = true
+      if (waiting) settle({ value: undefined, done: true })
+    },
+  }
+}
+
+function withTimeout(promise, message, ms = 1000) {
+  let timer
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms) })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
+}
+
+async function waitFor(condition, message, ms = 1000) {
+  const deadline = Date.now() + ms
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(message)
+    await new Promise((resolve) => setTimeout(resolve, 5))
   }
 }
 
@@ -290,4 +331,47 @@ test("V2 compaction hook injects session context and the summary instruction", a
   assert.match(compaction.system[0].text, /^summarize\n\nprevious session context\n\nCRITICAL INSTRUCTION FOR COMPACTED SUMMARY/)
   assert.match(compaction.system[0].text, /Use project: 'engram'/)
   assert.equal(runtime.requests.filter(({ path }) => path === "/context/compaction").length, 1)
+})
+
+test("V2 re-subscribes when the event stream ends", async (t) => {
+  const runtime = await setupV2(t)
+  runtime.events.end()
+  await waitFor(() => runtime.events.subscriptions.length === 2, "plugin did not re-subscribe after the stream ended")
+
+  await withTimeout(runtime.created("ses_root"), "event after re-subscription was not handled")
+  assert.equal(runtime.posts("/sessions").length, 1)
+  await runtime.cleanup()
+})
+
+test("V2 re-subscribes when the event stream throws", async (t) => {
+  const runtime = await setupV2(t)
+  runtime.events.fail(new Error("stream reset"))
+  await waitFor(() => runtime.events.subscriptions.length === 2, "plugin did not re-subscribe after the stream failed")
+
+  await withTimeout(runtime.created("ses_root"), "event after re-subscription was not handled")
+  assert.equal(runtime.posts("/sessions").length, 1)
+  await runtime.cleanup()
+})
+
+test("V2 keeps listening when handling one event throws", async (t) => {
+  const runtime = await setupV2(t)
+  const poisoned = { type: "session.created", get data() { throw new Error("malformed event") } }
+  await withTimeout(runtime.events.emit(poisoned), "loop stopped pulling after a failing event")
+  await withTimeout(runtime.created("ses_root"), "event after a failing event was not handled")
+
+  assert.equal(runtime.posts("/sessions").length, 1)
+  assert.equal(runtime.events.subscriptions.length, 1, "a failing event must not drop the subscription")
+  await runtime.cleanup()
+})
+
+test("V2 backs off between re-subscriptions and stops after cleanup", async (t) => {
+  const runtime = await setupV2(t)
+  runtime.events.closeForever()
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  const attempts = runtime.events.subscriptions.length
+  assert.ok(attempts >= 2 && attempts <= 6, `expected bounded re-subscription attempts, got ${attempts}`)
+
+  await withTimeout(runtime.cleanup(), "cleanup waited on the reconnect backoff")
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  assert.equal(runtime.events.subscriptions.length, attempts, "no re-subscription after cleanup")
 })
