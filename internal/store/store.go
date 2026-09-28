@@ -6050,14 +6050,10 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 						return nil, fmt.Errorf("import prompt %d: inbox identity already owned: %v", p.ID, err)
 					}
 					var canonical syncPromptPayload
-					var persistedProject sql.NullString
-					if err := tx.QueryRow(`SELECT sync_id, session_id, content, project, created_at, source_inbox_id FROM user_prompts WHERE id = ?`, existingID).Scan(&canonical.SyncID, &canonical.SessionID, &canonical.Content, &persistedProject, &canonical.CreatedAt, &canonical.SourceInboxID); err != nil {
+					if err := tx.QueryRow(`SELECT sync_id, session_id, content, created_at, source_inbox_id FROM user_prompts WHERE id = ?`, existingID).Scan(&canonical.SyncID, &canonical.SessionID, &canonical.Content, &canonical.CreatedAt, &canonical.SourceInboxID); err != nil {
 						return nil, fmt.Errorf("import prompt %d: read adopted prompt: %w", p.ID, err)
 					}
 					canonical.Project = nullableString(localProject)
-					if persistedProject.Valid && strings.TrimSpace(persistedProject.String) != "" {
-						canonical.Project = nullableString(persistedProject.String)
-					}
 					enrolled, err := isProjectEnrolledTx(tx, localProject)
 					if err != nil {
 						return nil, fmt.Errorf("import prompt %d: check enrollment: %w", p.ID, err)
@@ -11295,10 +11291,7 @@ func (s *Store) applyPromptDeleteTx(tx *sql.Tx, payload syncPromptPayload) error
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	if err == nil {
-		payload.SessionID = sessionID
-		payload.SourceInboxID = inboxID
-	} else if payload.SourceInboxID != "" {
+	if payload.SourceInboxID != "" && strings.TrimSpace(payload.SessionID) != "" {
 		var otherID string
 		lookupErr := tx.QueryRow(`SELECT sync_id FROM user_prompts WHERE session_id = ? AND source_inbox_id = ?`, payload.SessionID, payload.SourceInboxID).Scan(&otherID)
 		if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
@@ -11307,6 +11300,10 @@ func (s *Store) applyPromptDeleteTx(tx *sql.Tx, payload syncPromptPayload) error
 		if lookupErr == nil && otherID != payload.SyncID {
 			return fmt.Errorf("%w: delete prompt %q conflicts with inbox identity owned by %q", ErrPulledPromptIdentityInvalid, payload.SyncID, otherID)
 		}
+	}
+	if err == nil {
+		payload.SessionID = sessionID
+		payload.SourceInboxID = inboxID
 	}
 	if payload.SourceInboxID != "" && strings.TrimSpace(payload.SessionID) == "" {
 		return fmt.Errorf("%w: delete prompt %q: session id is required for source inbox id", ErrPulledPromptIdentityInvalid, payload.SyncID)

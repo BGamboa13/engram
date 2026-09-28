@@ -7879,6 +7879,86 @@ func TestImportAdoptionAppendsCanonicalPromptMutation(t *testing.T) {
 	}
 }
 
+func TestImportAdoptionNormalizesLegacyProjectInMutation(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("legacy-adopt", "alpha", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnrollProject("alpha"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.AddPrompt(AddPromptParams{SessionID: "legacy-adopt", Project: "alpha", Content: "keep"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncID := scalarString(t, s, `SELECT sync_id FROM user_prompts WHERE id = ?`, id)
+	if _, err := s.DB().Exec(`UPDATE user_prompts SET project = 'alpha ' WHERE id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Import(&ExportData{Prompts: []Prompt{{SyncID: syncID, SessionID: "legacy-adopt", Project: "alpha", Content: "keep", SourceInboxID: "inbox"}}}); err != nil {
+		t.Fatal(err)
+	}
+	var followUp SyncMutation
+	if err := s.DB().QueryRow(`SELECT seq, entity, entity_key, op, payload FROM sync_mutations WHERE entity = 'prompt' AND entity_key = ? ORDER BY seq DESC LIMIT 1`, syncID).Scan(&followUp.Seq, &followUp.Entity, &followUp.EntityKey, &followUp.Op, &followUp.Payload); err != nil {
+		t.Fatal(err)
+	}
+	if got := scalarString(t, s, `SELECT json_extract(payload, '$.project') FROM sync_mutations WHERE seq = ?`, followUp.Seq); got != "alpha" {
+		t.Fatalf("pending project = %q", got)
+	}
+	peer := newTestStore(t)
+	if err := peer.CreateSession("legacy-adopt", "alpha", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	followUp.Seq = 1
+	if err := peer.ApplyPulledMutation(DefaultSyncTargetKey, followUp); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := peer.ExportProject("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exported.Prompts) != 1 || exported.Prompts[0].SyncID != syncID || exported.Prompts[0].SourceInboxID != "inbox" {
+		t.Fatalf("peer project prompts = %+v", exported.Prompts)
+	}
+}
+
+func TestPulledPromptDeleteRejectsPairOwnedByOtherLivePrompt(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("pair-owner", "alpha", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.AddPrompt(AddPromptParams{SessionID: "pair-owner", Project: "alpha", Content: "A", SourceInboxID: "key-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.AddPrompt(AddPromptParams{SessionID: "pair-owner", Project: "alpha", Content: "B", SourceInboxID: "key-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	aid := scalarString(t, s, `SELECT sync_id FROM user_prompts WHERE id = ?`, a)
+	bid := scalarString(t, s, `SELECT sync_id FROM user_prompts WHERE id = ?`, b)
+	payload := fmt.Sprintf(`{"sync_id":%q,"session_id":"pair-owner","source_inbox_id":"key-b","deleted":true}`, aid)
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: aid, Op: SyncOpDelete, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{aid, bid} {
+		if got := scalarInt(t, s, `SELECT count(*) FROM user_prompts WHERE sync_id = ?`, id); got != 1 {
+			t.Fatalf("live %s = %d", id, got)
+		}
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM prompt_tombstones WHERE sync_id IN (?,?)`, aid, bid); got != 0 {
+		t.Fatalf("tombstones = %d", got)
+	}
+	rows, err := s.ListDeferred(ListDeferredOptions{Status: "dead"})
+	if err != nil || len(rows) != 1 || rows[0].PayloadRaw != payload || rows[0].ReasonCode != SyncPromptIdentityInvalidReasonCode || rows[0].RemoteSeq != 1 {
+		t.Fatalf("dead evidence=%+v err=%v", rows, err)
+	}
+	state, err := s.GetSyncState(DefaultSyncTargetKey)
+	if err != nil || state.LastPulledSeq != 1 {
+		t.Fatalf("cursor=%+v err=%v", state, err)
+	}
+}
+
 func TestImportAdoptionKeepsFollowUpAfterOriginalAck(t *testing.T) {
 	for _, ackBefore := range []bool{true, false} {
 		t.Run(fmt.Sprintf("ack before import=%t", ackBefore), func(t *testing.T) {
