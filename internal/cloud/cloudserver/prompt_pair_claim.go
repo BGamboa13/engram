@@ -17,6 +17,12 @@ type promptPairClaimStore interface {
 	ClaimPromptPair(context.Context, string, string, string, string, string) error
 }
 
+func sessionAuthorityUnavailable(w http.ResponseWriter) {
+	jsonResponse(w, http.StatusNotFound, map[string]string{
+		"error": "session authority unavailable", "error_code": "session_authority_unavailable",
+	})
+}
+
 func (s *CloudServer) handlePromptPairClaim(w http.ResponseWriter, r *http.Request) {
 	// Even if project policy is configured, an insecure server cannot issue claims.
 	principal, hasPrincipal := PrincipalFromContext(r.Context())
@@ -92,7 +98,7 @@ func (s *CloudServer) handlePromptPairClaim(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if authority == nil || authority.OwnerProject != owner {
-		http.Error(w, "session authority not found", http.StatusNotFound)
+		sessionAuthorityUnavailable(w)
 		return
 	}
 	actor := "legacy:authenticated"
@@ -105,7 +111,7 @@ func (s *CloudServer) handlePromptPairClaim(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		if errors.Is(err, cloudstore.ErrSessionAuthorityNotFound) {
-			http.Error(w, "session authority not found", http.StatusNotFound)
+			sessionAuthorityUnavailable(w)
 			return
 		}
 		http.Error(w, "prompt pair claim storage unavailable", http.StatusInternalServerError)

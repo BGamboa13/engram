@@ -3,6 +3,7 @@ package cloudserver
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -65,6 +66,7 @@ func TestPromptPairClaimAdmission(t *testing.T) {
 		{name: "replay", body: body, owner: "alpha", grants: []string{"alpha", "beta"}, token: "token", want: 200, lookups: 2, claims: 2, requests: 2},
 		{name: "conflict", body: body, owner: "alpha", grants: []string{"alpha", "beta"}, token: "token", claimErr: cloudstore.ErrPromptPairClaimConflict, want: 409, lookups: 1, claims: 1},
 		{name: "claim failure", body: body, owner: "alpha", grants: []string{"alpha", "beta"}, token: "token", claimErr: errors.New("secret database failure"), want: 500, lookups: 1, claims: 1},
+		{name: "authority vanished", body: body, owner: "alpha", grants: []string{"alpha", "beta"}, token: "token", claimErr: cloudstore.ErrSessionAuthorityNotFound, want: 404, lookups: 1, claims: 1},
 		{name: "lookup failure", body: body, grants: []string{"alpha", "beta"}, token: "token", lookupErr: errors.New("secret database failure"), want: 500, lookups: 1},
 		{name: "no token", body: body, grants: []string{"alpha", "beta"}, want: 401},
 		{name: "spoof actor", body: strings.TrimSuffix(body, "}") + `,"actor":"admin"}`, grants: []string{"alpha", "beta"}, token: "token", want: 400},
@@ -75,6 +77,7 @@ func TestPromptPairClaimAdmission(t *testing.T) {
 		{name: "oversize", body: body, grants: []string{"alpha", "beta"}, token: "token", limit: 20, want: 413},
 		{name: "oversize trailing", body: body + strings.Repeat(" ", 100), grants: []string{"alpha", "beta"}, token: "token", limit: int64(len(body) + 10), want: 413},
 	}
+	var unavailableBody string
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			st := &pairClaimStore{owner: tc.owner, lookupErr: tc.lookupErr, claimErr: tc.claimErr}
@@ -105,10 +108,17 @@ func TestPromptPairClaimAdmission(t *testing.T) {
 			if st.claims != 0 && (st.session != "s" || st.inbox != "i" || st.syncID != "y" || st.project != "beta" || st.actor != principal.ID) {
 				t.Fatalf("claim fields: %+v", st)
 			}
-			if tc.name == "missing" || tc.name == "wrong selector" {
-				if w.Body.String() != "session authority not found\n" {
-					t.Fatalf("unexpected disclosure: %q", w.Body.String())
+			if tc.name == "missing" || tc.name == "wrong selector" || tc.name == "authority vanished" {
+				var payload struct {
+					ErrorCode string `json:"error_code"`
 				}
+				if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil || payload.ErrorCode != "session_authority_unavailable" {
+					t.Fatalf("unexpected authority response: %q (%v)", w.Body.String(), err)
+				}
+				if unavailableBody != "" && unavailableBody != w.Body.String() {
+					t.Fatalf("authority response differs: %q vs %q", unavailableBody, w.Body.String())
+				}
+				unavailableBody = w.Body.String()
 			}
 			if tc.want == 500 && strings.Contains(w.Body.String(), "secret") {
 				t.Fatalf("database detail leaked: %q", w.Body.String())
