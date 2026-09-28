@@ -5928,15 +5928,15 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 		if identityErr == nil && ((tombstone.SessionID != "" && establishedSession != "" && tombstone.SessionID != establishedSession) || (tombstone.SourceInboxID != "" && establishedInbox != "" && tombstone.SourceInboxID != establishedInbox)) {
 			return nil, fmt.Errorf("import prompt tombstone %q: %w", tombstone.SyncID, ErrPulledPromptIdentityInvalid)
 		}
-		rows, err := s.queryItHook(tx, `SELECT sync_id, session_id, ifnull(project, ''), ifnull(source_inbox_id, '') FROM user_prompts WHERE sync_id = ? OR (? != '' AND session_id = ? AND source_inbox_id = ?)`, tombstone.SyncID, tombstone.SourceInboxID, tombstone.SessionID, tombstone.SourceInboxID)
+		rows, err := s.queryItHook(tx, `SELECT p.sync_id, p.session_id, ifnull(p.project, ''), ifnull(p.source_inbox_id, ''), ifnull(s.project, '') FROM user_prompts p LEFT JOIN sessions s ON s.id = p.session_id WHERE p.sync_id = ? OR (? != '' AND p.session_id = ? AND p.source_inbox_id = ?)`, tombstone.SyncID, tombstone.SourceInboxID, tombstone.SessionID, tombstone.SourceInboxID)
 		if err != nil {
 			return nil, fmt.Errorf("import prompt tombstone %q: load local prompts: %w", tombstone.SyncID, err)
 		}
-		type deletedPrompt struct{ syncID, sessionID, project, inboxID string }
+		type deletedPrompt struct{ syncID, sessionID, project, inboxID, sessionProject string }
 		var matched []deletedPrompt
 		for rows.Next() {
 			var prompt deletedPrompt
-			if err := rows.Scan(&prompt.syncID, &prompt.sessionID, &prompt.project, &prompt.inboxID); err != nil {
+			if err := rows.Scan(&prompt.syncID, &prompt.sessionID, &prompt.project, &prompt.inboxID, &prompt.sessionProject); err != nil {
 				return nil, fmt.Errorf("import prompt tombstone %q: scan local prompt: %w", tombstone.SyncID, closeRowsWithError(rows, err))
 			}
 			matched = append(matched, prompt)
@@ -5945,6 +5945,19 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 			return nil, fmt.Errorf("import prompt tombstone %q: read local prompts: %w", tombstone.SyncID, err)
 		}
 		for _, prompt := range matched {
+			owner := prompt.project
+			if strings.TrimSpace(owner) == "" {
+				owner = prompt.sessionProject
+			}
+			incoming := derefString(tombstone.Project)
+			if strings.TrimSpace(incoming) == "" {
+				incoming = prompt.sessionProject
+			}
+			owner, _ = NormalizeProject(owner)
+			incoming, _ = NormalizeProject(incoming)
+			if owner != incoming {
+				return nil, fmt.Errorf("import prompt tombstone %q: %w: project ownership conflict", tombstone.SyncID, ErrPulledPromptIdentityInvalid)
+			}
 			project, _ := NormalizeProject(prompt.project)
 			if project == "" {
 				project, err = s.resolveSessionProjectTx(tx, prompt.sessionID)
@@ -6035,6 +6048,11 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 					updated, err := res.RowsAffected()
 					if err != nil || updated != 1 {
 						return nil, fmt.Errorf("import prompt %d: inbox identity already owned: %v", p.ID, err)
+					}
+					if _, err := s.execHook(tx, `UPDATE sync_mutations SET payload = json_set(payload, '$.source_inbox_id', ?)
+						WHERE entity = ? AND entity_key = ? AND op = ? AND source = ? AND disposition = 'pending' AND acked_at IS NULL`,
+						p.SourceInboxID, SyncEntityPrompt, syncID, SyncOpUpsert, SyncSourceLocal); err != nil {
+						return nil, fmt.Errorf("import prompt %d: refresh pending identity: %w", p.ID, err)
 					}
 				}
 			}
@@ -11267,6 +11285,15 @@ func (s *Store) applyPromptDeleteTx(tx *sql.Tx, payload syncPromptPayload) error
 	if err == nil {
 		payload.SessionID = sessionID
 		payload.SourceInboxID = inboxID
+	} else if payload.SourceInboxID != "" {
+		var otherID string
+		lookupErr := tx.QueryRow(`SELECT sync_id FROM user_prompts WHERE session_id = ? AND source_inbox_id = ?`, payload.SessionID, payload.SourceInboxID).Scan(&otherID)
+		if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
+			return lookupErr
+		}
+		if lookupErr == nil && otherID != payload.SyncID {
+			return fmt.Errorf("%w: delete prompt %q conflicts with inbox identity owned by %q", ErrPulledPromptIdentityInvalid, payload.SyncID, otherID)
+		}
 	}
 	if payload.SourceInboxID != "" && strings.TrimSpace(payload.SessionID) == "" {
 		return fmt.Errorf("%w: delete prompt %q: session id is required for source inbox id", ErrPulledPromptIdentityInvalid, payload.SyncID)
