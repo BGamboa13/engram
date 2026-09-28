@@ -55,13 +55,14 @@ func TestPromptPairClaimAdmission(t *testing.T) {
 		lookupErr, claimErr   error
 		limit                 int64
 		want, lookups, claims int
+		requests              int
 	}{
 		{name: "dual grant", body: body, owner: "alpha", grants: []string{"alpha", "beta"}, token: "token", want: 200, lookups: 1, claims: 1},
 		{name: "beta only", body: body, owner: "alpha", grants: []string{"beta"}, token: "token", want: 403},
 		{name: "alpha only", body: body, owner: "alpha", grants: []string{"alpha"}, token: "token", want: 403},
 		{name: "missing", body: body, grants: []string{"alpha", "beta"}, token: "token", want: 404, lookups: 1},
 		{name: "wrong selector", body: body, owner: "other", grants: []string{"alpha", "beta"}, token: "token", want: 404, lookups: 1},
-		{name: "replay", body: body, owner: "alpha", grants: []string{"alpha", "beta"}, token: "token", want: 200, lookups: 1, claims: 1},
+		{name: "replay", body: body, owner: "alpha", grants: []string{"alpha", "beta"}, token: "token", want: 200, lookups: 2, claims: 2, requests: 2},
 		{name: "conflict", body: body, owner: "alpha", grants: []string{"alpha", "beta"}, token: "token", claimErr: cloudstore.ErrPromptPairClaimConflict, want: 409, lookups: 1, claims: 1},
 		{name: "claim failure", body: body, owner: "alpha", grants: []string{"alpha", "beta"}, token: "token", claimErr: errors.New("secret database failure"), want: 500, lookups: 1, claims: 1},
 		{name: "lookup failure", body: body, grants: []string{"alpha", "beta"}, token: "token", lookupErr: errors.New("secret database failure"), want: 500, lookups: 1},
@@ -82,14 +83,24 @@ func TestPromptPairClaimAdmission(t *testing.T) {
 				opts = append(opts, WithMaxPushBodyBytes(tc.limit))
 			}
 			srv := New(st, resolvingAuth{principals: map[string]cloudauth.Principal{"token": principal}}, 0, opts...)
-			req := httptest.NewRequest(http.MethodPost, "/sync/prompt-pair-claims", strings.NewReader(tc.body))
-			if tc.token != "" {
-				req.Header.Set("Authorization", "Bearer "+tc.token)
+			requests := tc.requests
+			if requests == 0 {
+				requests = 1
 			}
-			w := httptest.NewRecorder()
-			srv.Handler().ServeHTTP(w, req)
-			if w.Code != tc.want || st.lookup != tc.lookups || st.claims != tc.claims {
-				t.Fatalf("status=%d body=%q lookup=%d claims=%d; want %d/%d/%d", w.Code, w.Body.String(), st.lookup, st.claims, tc.want, tc.lookups, tc.claims)
+			var w *httptest.ResponseRecorder
+			for i := 0; i < requests; i++ {
+				req := httptest.NewRequest(http.MethodPost, "/sync/prompt-pair-claims", strings.NewReader(tc.body))
+				if tc.token != "" {
+					req.Header.Set("Authorization", "Bearer "+tc.token)
+				}
+				w = httptest.NewRecorder()
+				srv.Handler().ServeHTTP(w, req)
+				if w.Code != tc.want {
+					t.Fatalf("request %d status=%d body=%q; want %d", i, w.Code, w.Body.String(), tc.want)
+				}
+			}
+			if st.lookup != tc.lookups || st.claims != tc.claims {
+				t.Fatalf("lookup=%d claims=%d; want %d/%d", st.lookup, st.claims, tc.lookups, tc.claims)
 			}
 			if st.claims != 0 && (st.session != "s" || st.inbox != "i" || st.syncID != "y" || st.project != "beta" || st.actor != principal.ID) {
 				t.Fatalf("claim fields: %+v", st)
