@@ -860,4 +860,142 @@ export const Engram: Plugin = async (ctx) => {
   }
 }
 
-export default { id: "engram", server: Engram }
+// ─── OpenCode V2 Adapter ─────────────────────────────────────────────────────
+// OpenCode V2 calls `setup(ctx)` instead of `server`. It exposes hooks through
+// per-domain registrations and session lifecycle through an event stream, so
+// this adapter translates them onto the V1 hooks above and adds no behavior.
+// Types are declared structurally: V1 hosts may not ship `@opencode/plugin`.
+//
+// Not exported by name on purpose: older V1 loaders call every exported
+// function as a plugin factory.
+
+type V2SystemPart = { type: "text"; text: string }
+type V2Registration = { dispose: () => Promise<void> }
+type V2Hook = (name: string, callback: (input: any) => Promise<void> | void) => Promise<V2Registration>
+type V2Context = {
+  location: { directory: string; project?: { id?: string } }
+  event: { subscribe: (options?: { signal?: AbortSignal }) => AsyncIterable<any> }
+  session: { get: (input: { sessionID: string }) => Promise<any>; hook: V2Hook }
+  tool: { hook: V2Hook }
+}
+
+// V1 hooks append to the last system string; V2 carries system text parts.
+function appendSystemText(system: V2SystemPart[], text: string): void {
+  const last = system[system.length - 1]
+  if (last) system[system.length - 1] = { ...last, text: `${last.text}\n\n${text}` }
+  else system.push({ type: "text", text })
+}
+
+async function withSystemStrings(system: V2SystemPart[], run: (texts: string[]) => Promise<void>): Promise<void> {
+  const texts = system.map((part) => part.text)
+  await run(texts)
+  texts.forEach((text, index) => {
+    if (index >= system.length) system.push({ type: "text", text })
+    else if (text !== system[index].text) system[index] = { ...system[index], text }
+  })
+}
+
+function v2ToolResultText(result: any): string {
+  const text = Array.isArray(result?.content)
+    ? result.content.filter((part: any) => part?.type === "text").map((part: any) => part.text ?? "").join("\n")
+    : ""
+  return text || (result?.output === undefined ? "" : JSON.stringify(result.output))
+}
+
+// V2 session events carry `data.sessionID`; V1 hooks expect `properties.info.id`.
+function v1SessionEvent(event: any, directory: string): any {
+  const data = event?.data
+  if (typeof data?.sessionID !== "string") return undefined
+  if (event.type === "session.created") {
+    // The V2 server is shared across locations; V1 only saw its own instance.
+    if (data.location?.directory && data.location.directory !== directory) return undefined
+    return { type: event.type, properties: { info: { id: data.sessionID, parentID: data.parentID, projectID: data.projectID } } }
+  }
+  if (event.type === "session.deleted") {
+    return { type: event.type, properties: { info: { id: data.sessionID } } }
+  }
+  return undefined
+}
+
+async function setupEngramV2(ctx: V2Context): Promise<() => Promise<void>> {
+  const hooks: Record<string, any> = await Engram({
+    directory: ctx.location.directory,
+    project: { id: ctx.location.project?.id },
+    client: {
+      session: {
+        // V1 SDK results carry `{ data, error }`; the V2 client throws instead.
+        async get({ path }: { path: { id: string } }) {
+          try {
+            return { data: await ctx.session.get({ sessionID: path.id }) }
+          } catch (error) {
+            return { error }
+          }
+        },
+      },
+    },
+  } as any)
+
+  const abort = new AbortController()
+  const registrations: V2Registration[] = []
+  let listening: Promise<void> = Promise.resolve()
+  const cleanup = async () => {
+    abort.abort()
+    await Promise.all(registrations.map((registration) => registration.dispose()))
+    await listening
+    await hooks.dispose?.()
+  }
+
+  try {
+    registrations.push(await ctx.session.hook("prompt", async (prompt) => {
+      await hooks["chat.message"]({ sessionID: prompt.sessionID }, {
+        message: {},
+        parts: [{ type: "text", text: prompt.prompt?.text ?? "" }],
+      })
+    }))
+
+    registrations.push(await ctx.session.hook("context", async (request) => {
+      await withSystemStrings(request.system, (system) =>
+        hooks["experimental.chat.system.transform"]({ sessionID: request.sessionID, model: request.model }, { system }))
+    }))
+
+    registrations.push(await ctx.session.hook("compaction", async (request) => {
+      const context: string[] = []
+      await hooks["experimental.session.compacting"]({ sessionID: request.sessionID }, { context })
+      if (context.length > 0) appendSystemText(request.system, context.join("\n\n"))
+    }))
+
+    registrations.push(await ctx.tool.hook("execute.before", async (call) => {
+      const args = call.input && typeof call.input === "object" ? call.input : {}
+      await hooks["tool.execute.before"]({ tool: call.tool, sessionID: call.sessionID, callID: call.id }, { args })
+      if (args !== call.input && Object.keys(args).length > 0) call.input = args
+    }))
+
+    registrations.push(await ctx.tool.hook("execute.after", async (call) => {
+      // V2 renamed the V1 `Task` delegation tool to `subagent`.
+      const tool = call.tool === "subagent" ? "Task" : call.tool
+      const output = call.status === "completed" ? v2ToolResultText(call.result) : ""
+      await hooks["tool.execute.after"]({ tool, sessionID: call.sessionID, callID: call.id }, output)
+    }))
+
+    const events = ctx.event.subscribe({ signal: abort.signal })
+    listening = (async () => {
+      try {
+        for await (const event of events) {
+          if (abort.signal.aborted) break
+          const translated = v1SessionEvent(event, ctx.location.directory)
+          if (translated) await hooks.event({ event: translated }).catch(() => {})
+        }
+      } catch {
+        // Stream failure loses lifecycle events; hooks still bind sessions lazily.
+      }
+    })()
+  } catch (cause) {
+    await cleanup()
+    throw cause
+  }
+
+  return cleanup
+}
+
+// V1 (1.18.29+) calls server(); V2 calls setup().
+export default { id: "engram", server: Engram, setup: setupEngramV2 }
