@@ -44,6 +44,8 @@ engram setup opencode
 
 The plugin auto-starts the HTTP server if it's not already running — no manual `engram serve` needed.
 
+The same `engram.ts` supports OpenCode 1.x (1.18.29+) and 2.x. Its default export provides a V1 `server` entry and a V2 `setup` entry; the V2 entry maps session, prompt, context, compaction, and tool hooks onto the same handlers, so both majors share one behavior. OpenCode 2.x still accepts the MCP entry written by `engram setup opencode`, so the same command covers both majors. V2 has no `session.updated` event, so a late root-to-child reclassification relies on `parentID` at creation and on session lookups in hooks.
+
 > **Local model compatibility:** The plugin works with all models, including local ones served via llama.cpp, Ollama, or similar. The Memory Protocol is concatenated into the existing system prompt (not added as a separate system message), so models with strict Jinja templates (Qwen, Mistral/Ministral) work correctly.
 
 ### What the Plugin Does
