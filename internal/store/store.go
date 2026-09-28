@@ -11311,6 +11311,11 @@ func (s *Store) applyPromptDeleteTx(tx *sql.Tx, payload syncPromptPayload) error
 	if payload.Project == nil || strings.TrimSpace(*payload.Project) == "" {
 		owner := promptProject
 		if strings.TrimSpace(owner) == "" {
+			if err := tx.QueryRow(`SELECT ifnull(project, '') FROM prompt_tombstones WHERE sync_id = ?`, payload.SyncID).Scan(&owner); err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		}
+		if strings.TrimSpace(owner) == "" {
 			err := tx.QueryRow(`SELECT coalesce((SELECT nullif(project, '') FROM sessions WHERE id = ?), (SELECT project FROM sync_delete_tombstones WHERE entity = 'session' AND entity_key = ? AND active = 1), '')`, payload.SessionID, payload.SessionID).Scan(&owner)
 			if err != nil {
 				return err
