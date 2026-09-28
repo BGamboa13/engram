@@ -14,6 +14,7 @@ func TestLocalPromptCreationIdentity(t *testing.T) {
 			t.Fatalf("syncID %q: %q %q %q %v %v", syncID, gotSession, gotInbox, gotProject, gotEligible, err)
 		}
 	}
+	check("", "", "", "", false)
 	keyed := AddPromptParams{SessionID: "session", Project: "beta", SourceInboxID: "inbox", Content: "local"}
 	id, inserted, err := s.AddPromptWithResult(keyed)
 	if err != nil || !inserted {
@@ -91,6 +92,19 @@ func TestLocalPromptCreationIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	check(localSyncID, "", "", "", false)
+	deleteID, inserted, err := s.AddPromptWithResult(AddPromptParams{SessionID: "session", Project: "beta", SourceInboxID: "delete-inbox", Content: "delete"})
+	if err != nil || !inserted {
+		t.Fatalf("delete insert: %v %v", inserted, err)
+	}
+	var deleteSyncID string
+	if err := s.DB().QueryRow(`SELECT sync_id FROM user_prompts WHERE id=?`, deleteID).Scan(&deleteSyncID); err != nil {
+		t.Fatal(err)
+	}
+	check(deleteSyncID, "session", "delete-inbox", "beta", true)
+	if err := s.DeletePrompt(deleteID); err != nil {
+		t.Fatal(err)
+	}
+	check(deleteSyncID, "", "", "", false)
 }
 
 func TestLocalPromptCreationIdentityDuplicateSyncID(t *testing.T) {
