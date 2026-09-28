@@ -8012,6 +8012,46 @@ func TestPromptTombstoneIdentityCannotRebind(t *testing.T) {
 	}
 }
 
+func TestImportPromptTombstoneProjectCannotRebind(t *testing.T) {
+	s := newTestStore(t)
+	original := PromptTombstone{SyncID: "fixed-project", SessionID: "owner", SourceInboxID: "key", Project: nullableString("alpha"), DeletedAt: Now()}
+	if _, err := s.Import(&ExportData{PromptTombstones: []PromptTombstone{original}}); err != nil {
+		t.Fatal(err)
+	}
+	conflict := original
+	conflict.Project = nullableString("beta")
+	if _, err := s.Import(&ExportData{PromptTombstones: []PromptTombstone{{SyncID: "rolled-back", DeletedAt: Now()}, conflict}}); !errors.Is(err, ErrPulledPromptIdentityInvalid) {
+		t.Fatalf("conflicting project import error = %v", err)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM prompt_tombstones WHERE sync_id = 'rolled-back'`); got != 0 {
+		t.Fatalf("failed import persisted earlier tombstone: %d", got)
+	}
+	owner, err := s.ExportProject("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(owner.PromptTombstones) != 1 || owner.PromptTombstones[0].SyncID != original.SyncID || owner.PromptTombstones[0].Project == nil || *owner.PromptTombstones[0].Project != "alpha" {
+		t.Fatalf("owner lost tombstone: %+v", owner.PromptTombstones)
+	}
+	other, err := s.ExportProject("beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(other.PromptTombstones) != 0 {
+		t.Fatalf("other project leaked tombstone: %+v", other.PromptTombstones)
+	}
+	fresh := newTestStore(t)
+	if _, err := fresh.Import(owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.CreateSession("owner", "alpha", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if id, inserted, err := fresh.AddPromptWithResult(AddPromptParams{SessionID: "owner", Project: "alpha", Content: "replay", SourceInboxID: "key"}); !errors.Is(err, ErrPromptInboxDeleted) || id != 0 || inserted {
+		t.Fatalf("replay accepted: id=%d inserted=%v err=%v", id, inserted, err)
+	}
+}
+
 func TestImportConflictingTombstoneDoesNotDeleteMatchedPrompt(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("owner", "engram", "/tmp"); err != nil {

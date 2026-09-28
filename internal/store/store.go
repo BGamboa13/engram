@@ -9244,12 +9244,12 @@ func (s *Store) recordPromptTombstoneTx(tx *sql.Tx, syncID, sessionID string, pr
 		normalized, _ := NormalizeProject(strings.TrimSpace(*project))
 		project = nullableString(normalized)
 	}
-	var existingSession, existingInbox string
-	err := tx.QueryRow(`SELECT ifnull(session_id, ''), ifnull(source_inbox_id, '') FROM prompt_tombstones WHERE sync_id = ?`, syncID).Scan(&existingSession, &existingInbox)
+	var existingSession, existingInbox, existingProject string
+	err := tx.QueryRow(`SELECT ifnull(session_id, ''), ifnull(source_inbox_id, ''), ifnull(project, '') FROM prompt_tombstones WHERE sync_id = ?`, syncID).Scan(&existingSession, &existingInbox, &existingProject)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	if err == nil && ((sessionID != "" && existingSession != "" && sessionID != existingSession) || (inboxID != "" && existingInbox != "" && inboxID != existingInbox)) {
+	if err == nil && ((sessionID != "" && existingSession != "" && sessionID != existingSession) || (inboxID != "" && existingInbox != "" && inboxID != existingInbox) || (project != nil && existingProject != "" && *project != existingProject)) {
 		return fmt.Errorf("%w: prompt tombstone %q conflicts with established identity", ErrPulledPromptIdentityInvalid, syncID)
 	}
 	_, err = s.execHook(tx,
