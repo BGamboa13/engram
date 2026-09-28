@@ -91,10 +91,13 @@ func TestMutationProvenanceRejectsUnverifiedSuccess(t *testing.T) {
 }
 
 func TestMutationProvenanceNetworkFailure(t *testing.T) {
-	mt, err := NewMutationTransport("http://127.0.0.1:1", "")
+	mt, err := NewMutationTransport("http://cloud.example.test", "")
 	if err != nil {
 		t.Fatal(err)
 	}
+	mt.httpClient = &http.Client{Transport: remoteRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("offline")
+	})}
 	if err := mt.ClaimPromptPair("s", "i", "y", "owner", "prompt"); err == nil {
 		t.Fatal("network failure accepted")
 	}

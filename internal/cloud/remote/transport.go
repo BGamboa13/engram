@@ -394,7 +394,7 @@ func (mt *MutationTransport) postProvenance(operation, path string, payload any)
 	if err != nil {
 		return fmt.Errorf("cloud: %s: %w", operation, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		response, _ := io.ReadAll(resp.Body)
 		return newProvenanceHTTPStatusError(operation, resp.StatusCode, response)
