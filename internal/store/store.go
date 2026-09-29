@@ -3128,6 +3128,9 @@ func (s *Store) ResumeSessionWithOwnershipMode(id, project, directory, mode stri
 	return effective, nil
 }
 
+// sessions.id uses SQLite's default BINARY collation: ':' follows ASCII '9'.
+const continuationSessionsQuery = `SELECT id, ended_at FROM sessions WHERE id >= ? AND id < ? ORDER BY id`
+
 // continuationSessionTx selects the lowest numeric live continuation, or the
 // next ordinal after all numeric suffixes. Literal prefix comparison avoids SQL
 // wildcard interpretation. Arbitrary precision ordinals impose no restart cap.
@@ -3141,7 +3144,7 @@ func continuationSessionTx(tx *sql.Tx, root string) (string, error) {
 		return "", err
 	}
 	prefix := root + ":resume:"
-	rows, err := tx.Query(`SELECT id, ended_at FROM sessions WHERE substr(id, 1, length(?)) = ? ORDER BY id`, prefix, prefix)
+	rows, err := tx.Query(continuationSessionsQuery, prefix+"0", prefix+":")
 	if err != nil {
 		return "", err
 	}
@@ -3154,6 +3157,9 @@ func continuationSessionTx(tx *sql.Tx, root string) (string, error) {
 		var ended *string
 		if err := rows.Scan(&id, &ended); err != nil {
 			return "", err
+		}
+		if !strings.HasPrefix(id, prefix) {
+			continue
 		}
 		suffix := strings.TrimPrefix(id, prefix)
 		if suffix == "" || strings.IndexFunc(suffix, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
@@ -3201,7 +3207,34 @@ func (s *Store) startSessionRegistration(id, project, directory, mode string, re
 		claimed = false
 		id = root
 		if resume {
-			var err error
+			// Validate terminal root ownership before looking up any continuation.
+			// A compatible suffix cannot bypass the requested identity's owner.
+			var endedAt *string
+			err := tx.QueryRow(`SELECT ended_at FROM sessions WHERE id = ?`, root).Scan(&endedAt)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if err == nil && endedAt != nil {
+				owner, ownerMode, _, err := sessionOwnershipTx(tx, root)
+				if err != nil {
+					return err
+				}
+				if err := sessionRegistrationProjectError(root, owner, ownerMode, project, mode); err != nil {
+					if errors.Is(err, ErrSessionOwnershipMismatch) {
+						return &SessionProjectConflictError{SessionID: root, OwnerProject: owner, RequestedProject: project}
+					}
+					return err
+				}
+				if mode == SessionOwnershipProjectOwned && owner == "" {
+					_, foreignOwner, err := foreignRecordOwnerTx(tx, root, project)
+					if err != nil {
+						return err
+					}
+					if foreignOwner != "" {
+						return &SessionProjectConflictError{SessionID: root, OwnerProject: foreignOwner, RequestedProject: project}
+					}
+				}
+			}
 			id, err = continuationSessionTx(tx, root)
 			if err != nil {
 				return err
@@ -3258,10 +3291,7 @@ func (s *Store) startSessionRegistration(id, project, directory, mode string, re
 			}
 		}
 		if found {
-			if mode == SessionOwnershipProjectOwned && existingProject != "" && existingProject != project {
-				return &SessionProjectConflictError{SessionID: id, OwnerProject: existingProject, RequestedProject: project}
-			}
-			if err := sessionProjectWriteError(id, existingProject, existingMode, project); err != nil {
+			if err := sessionRegistrationProjectError(id, existingProject, existingMode, project, mode); err != nil {
 				if resume && id != root {
 					return &SessionProjectConflictError{SessionID: id, OwnerProject: existingProject, RequestedProject: project}
 				}
@@ -10679,6 +10709,15 @@ func sessionOwnershipTx(tx *sql.Tx, sessionID string) (project, mode string, fou
 	}
 	normalized, _ := NormalizeProject(strings.TrimSpace(rawProject.String))
 	return normalized, strings.TrimSpace(rawMode.String), true, nil
+}
+
+// sessionRegistrationProjectError applies the normal registration ownership
+// rules both to a requested root and to its selected runtime identity.
+func sessionRegistrationProjectError(id, owner, ownerMode, project, mode string) error {
+	if mode == SessionOwnershipProjectOwned && owner != "" && owner != project {
+		return &SessionProjectConflictError{SessionID: id, OwnerProject: owner, RequestedProject: project}
+	}
+	return sessionProjectWriteError(id, owner, ownerMode, project)
 }
 
 func sessionProjectWriteError(sessionID, sessionProject, mode, requested string) error {

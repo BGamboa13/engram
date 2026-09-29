@@ -93,6 +93,44 @@ func TestCreateSessionResumeConflict(t *testing.T) {
 	}
 }
 
+func TestCreateSessionResumeEndedRootProjectConflict(t *testing.T) {
+	for _, mode := range []string{store.SessionOwnershipProjectOwned, store.SessionOwnershipShared} {
+		for _, continuation := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/continuation=%v", mode, continuation), func(t *testing.T) {
+				st := newServerTestStore(t)
+				if err := st.StartSessionWithOwnershipMode("root", "project-a", "/work", store.SessionOwnershipProjectOwned); err != nil {
+					t.Fatal(err)
+				}
+				if err := st.EndSession("root", "done"); err != nil {
+					t.Fatal(err)
+				}
+				if continuation {
+					if err := st.StartSessionWithOwnershipMode("root:resume:2", "project-b", "/work", mode); err != nil {
+						t.Fatal(err)
+					}
+				}
+				rec := httptest.NewRecorder()
+				New(st, 0).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(fmt.Sprintf(`{"id":"root","project":"project-b","resume":true,"ownership_mode":%q}`, mode))))
+				var ack map[string]string
+				if err := json.Unmarshal(rec.Body.Bytes(), &ack); err != nil {
+					t.Fatal(err)
+				}
+				if rec.Code != http.StatusConflict || ack["code"] != "session_project_conflict" || ack["session_id"] != "root" || ack["owner_project"] != "project-a" || ack["requested_project"] != "project-b" {
+					t.Fatalf("root conflict: %d %v", rec.Code, ack)
+				}
+				if !continuation {
+					if _, err := st.GetSession("root:resume:2"); err == nil {
+						t.Fatal("created continuation despite root conflict")
+					}
+				}
+				if _, err := st.GetSession("root:resume:3"); err == nil {
+					t.Fatal("advanced past root conflict")
+				}
+			})
+		}
+	}
+}
+
 func TestCreateSessionResumeConcurrent(t *testing.T) {
 	st := newServerTestStore(t)
 	srv := New(st, 0)

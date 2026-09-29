@@ -369,6 +369,27 @@ test("an uncertain initial resume never guesses a cleanup identity", async (t) =
   assert.equal(runtime.requests.filter((r) => r.path.endsWith("/end")).length, 0)
 })
 
+test("a timed-out registration followed by refusal never guesses an effective ID", async (t) => {
+  const runtime = await createRuntime(t, {
+    registrationResponse: (attempt) => {
+      if (attempt === 1) throw new Error("registration timed out")
+      return registrationFailure("session_already_ended")
+    },
+  })
+  for (const error of [/could not confirm/, /session_already_ended/]) {
+    const output = toolOutput()
+    await assert.rejects(runtime.before({ sessionID: "runtime", tool: "mem_save" }, output), error)
+    assert.equal(output.args.session_id, MODEL_SESSION_ID, "no MCP session_id is injected without an acknowledgement")
+  }
+  await runtime.chat({ sessionID: "runtime" }, { parts: [{ type: "text", text: "Continue the conversation" }], message: {} })
+  await runtime.after({ sessionID: "runtime", tool: "Task" }, "A reusable learning from this completed task that exceeds fifty characters")
+  assert.ok(runtime.registeredIDs.length >= 2)
+  assert.ok(runtime.registeredIDs.every((id) => id === "runtime"), "registration never invents a continuation ID")
+  assert.equal(runtime.requests.filter((r) => ["/prompts", "/observations/passive"].includes(r.path)).length, 0, "refused sessions accept no writes")
+  await runtime.dispose()
+  assert.equal(runtime.requests.filter((r) => r.path.endsWith("/end")).length, 0, "dispose never ends an unacknowledged or guessed ID")
+})
+
 test("separate plugin instances converge on the same resumed identity", async (t) => {
   const options = { registrationResponse: () => httpResponse({ id: "runtime:resume:2", status: "created" }) }
   const first = await createRuntime(t, options)

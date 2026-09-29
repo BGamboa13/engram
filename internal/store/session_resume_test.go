@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -144,6 +145,89 @@ func TestResumeSessionSelection(t *testing.T) {
 				t.Fatalf("persisted mode: %+v %v", session, err)
 			}
 		})
+	}
+}
+
+func TestResumeSessionEndedRootOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name, rootMode, requestMode, project string
+		conflict                             bool
+	}{
+		{"project-owned root rejects foreign strict registration", SessionOwnershipProjectOwned, SessionOwnershipProjectOwned, "foreign", true},
+		{"project-owned root rejects foreign shared registration", SessionOwnershipProjectOwned, SessionOwnershipShared, "foreign", true},
+		{"project-owned root accepts same-project registration", SessionOwnershipProjectOwned, SessionOwnershipProjectOwned, "engram", false},
+		{"shared root accepts foreign shared registration", SessionOwnershipShared, SessionOwnershipShared, "foreign", false},
+		{"shared root rejects foreign strict registration", SessionOwnershipShared, SessionOwnershipProjectOwned, "foreign", true},
+	} {
+		for _, continuation := range []bool{false, true} {
+			name := "without continuation"
+			if continuation {
+				name = "with compatible live continuation"
+			}
+			t.Run(tc.name+"/"+name, func(t *testing.T) {
+				s := newTestStore(t)
+				if err := s.StartSessionWithOwnershipMode("root", "engram", "/work", tc.rootMode); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.EndSession("root", "done"); err != nil {
+					t.Fatal(err)
+				}
+				if continuation {
+					if err := s.StartSessionWithOwnershipMode("root:resume:2", tc.project, "/work", tc.requestMode); err != nil {
+						t.Fatal(err)
+					}
+				}
+				got, err := s.ResumeSessionWithOwnershipMode("root", tc.project, "/work", tc.requestMode)
+				if tc.conflict {
+					var conflict *SessionProjectConflictError
+					if got != "" || !errors.As(err, &conflict) || conflict.SessionID != "root" || conflict.OwnerProject != "engram" || conflict.RequestedProject != tc.project {
+						t.Fatalf("root conflict: id=%q err=%v", got, err)
+					}
+				} else if err != nil || got != "root:resume:2" {
+					t.Fatalf("resume: id=%q err=%v", got, err)
+				}
+				var count int
+				if err := s.db.QueryRow(`SELECT count(*) FROM sessions`).Scan(&count); err != nil {
+					t.Fatal(err)
+				}
+				want := 2
+				if tc.conflict && !continuation {
+					want = 1
+				}
+				if count != want {
+					t.Fatalf("sessions=%d, want %d", count, want)
+				}
+				root, err := s.GetSession("root")
+				if err != nil || root.EndedAt == nil || root.Project != "engram" || root.OwnershipMode != tc.rootMode {
+					t.Fatalf("root changed: %+v err=%v", root, err)
+				}
+			})
+		}
+	}
+}
+
+func TestResumeSessionContinuationQueryUsesPrimaryKeySearch(t *testing.T) {
+	s := newTestStore(t)
+	rows, err := s.db.Query("EXPLAIN QUERY PLAN "+continuationSessionsQuery, "root:resume:0", "root:resume::")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(plan, "\n")
+	if !strings.Contains(joined, "SEARCH sessions USING INDEX sqlite_autoindex_sessions_1 (id>?") || strings.Contains(joined, "SCAN") {
+		t.Fatalf("expected primary-key range SEARCH, not SCAN:\n%s", joined)
 	}
 }
 
