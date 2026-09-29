@@ -6389,6 +6389,22 @@ func (s *Store) CloudSyncSummary() (CloudSyncSummary, error) {
 	return summary, nil
 }
 
+// MaxPendingSyncMutationSeq returns the highest sequence eligible for pending sync
+// on targetKey, or zero when none exists. Like ListPendingSyncMutationsAfterSeq,
+// only unacknowledged pending mutations for enrolled or global projects qualify;
+// sync_state counters do not determine this bound.
+func (s *Store) MaxPendingSyncMutationSeq(targetKey string) (int64, error) {
+	targetKey = normalizeSyncTargetKey(targetKey)
+	var seq int64
+	err := s.db.QueryRow(`
+		SELECT COALESCE(MAX(sm.seq), 0)
+		FROM sync_mutations sm
+		LEFT JOIN sync_enrolled_projects sep ON sm.project = sep.project
+		WHERE sm.target_key = ? AND sm.acked_at IS NULL AND sm.disposition = 'pending'
+		  AND (sm.project = '' OR sep.project IS NOT NULL)`, targetKey).Scan(&seq)
+	return seq, err
+}
+
 func (s *Store) ListPendingSyncMutationsAfterSeq(targetKey string, afterSeq int64, limit int) ([]SyncMutation, error) {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	if limit <= 0 {

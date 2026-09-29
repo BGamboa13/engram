@@ -11982,6 +11982,61 @@ func TestListPendingSyncMutationsIncludesProject(t *testing.T) {
 	}
 }
 
+func TestMaxPendingSyncMutationSeq(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnrollProject("enrolled"); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+	const target = "cloud:high-water-test"
+	for _, key := range []string{target, "cloud:other-high-water"} {
+		if _, err := s.db.Exec(`INSERT INTO sync_state (target_key, lifecycle, last_enqueued_seq, updated_at) VALUES (?, 'idle', 0, datetime('now'))`, key); err != nil {
+			t.Fatalf("insert sync state %s: %v", key, err)
+		}
+	}
+	insert := func(key, targetKey, project, ackedAt, disposition string) int64 {
+		t.Helper()
+		var acked any
+		if ackedAt != "" {
+			acked = ackedAt
+		}
+		result, err := s.db.Exec(`INSERT INTO sync_mutations
+			(target_key, entity, entity_key, op, payload, source, project, acked_at, disposition)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, targetKey, SyncEntityObservation, key,
+			SyncOpUpsert, `{}`, SyncSourceLocal, project, acked, disposition)
+		if err != nil {
+			t.Fatalf("insert %s: %v", key, err)
+		}
+		seq, err := result.LastInsertId()
+		if err != nil {
+			t.Fatalf("sequence %s: %v", key, err)
+		}
+		return seq
+	}
+	check := func(targetKey string, want int64) {
+		t.Helper()
+		got, err := s.MaxPendingSyncMutationSeq(targetKey)
+		if err != nil || got != want {
+			t.Fatalf("MaxPendingSyncMutationSeq(%q) = %d, %v; want %d", targetKey, got, err, want)
+		}
+	}
+	check(target, 0)
+	insert("other-target", "cloud:other-high-water", "", "", "pending")
+	global := insert("global", target, "", "", "pending")
+	insert("un-enrolled", target, "not-enrolled", "", "pending")
+	insert("acked", target, "enrolled", "2025-01-01T00:00:00Z", "pending")
+	insert("quarantined", target, "enrolled", "", "quarantined")
+	eligible := insert("enrolled", target, "enrolled", "", "pending")
+	if _, err := s.db.Exec(`UPDATE sync_state SET last_enqueued_seq = 0 WHERE target_key = ?`, target); err != nil {
+		t.Fatalf("stale sync state: %v", err)
+	}
+	check(target, eligible)
+	check("cloud:other-high-water", 1)
+	if _, err := s.db.Exec(`UPDATE sync_mutations SET acked_at = ? WHERE seq = ?`, "2025-01-01T00:00:00Z", eligible); err != nil {
+		t.Fatalf("ack eligible: %v", err)
+	}
+	check(target, global)
+}
+
 func TestCountPendingNonEnrolledSyncMutations(t *testing.T) {
 	s := newTestStore(t)
 
