@@ -1972,7 +1972,9 @@ export default function registerEngram(pi: ExtensionAPI) {
       if (knownSessions.has(`\u0000closing:${effectiveID}`)) return { systemPrompt };
       const body: PromptBody = {
         session_id: effectiveID,
-        content: stripPrivateTags(truncate(finalContent, 2000)),
+        // Redact before truncating: a <private> block straddling the limit
+        // would otherwise lose its closing tag and leak.
+        content: truncate(stripPrivateTags(finalContent), 2000),
         project,
       };
       if (state && (state.closing || state.epoch !== epoch)) return { systemPrompt };
