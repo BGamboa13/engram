@@ -570,6 +570,7 @@ export const Engram: Plugin = async (ctx) => {
       while (ordinal <= MAX_SESSION_ORDINAL) {
         const candidate = ordinal === 1 ? sessionId : `${sessionId}:resume:${ordinal}`
         // An uncertain delivery still needs cleanup, as before (#1131).
+        const owned = cleanup.has(candidate)
         cleanup.add(candidate)
         const result = await engramFetchResult("/sessions", {
           method: "POST",
@@ -580,8 +581,11 @@ export const Engram: Plugin = async (ctx) => {
           knownSessions.add(sessionId)
           return true
         }
-        if (result && !result.ok) cleanup.delete(candidate)
-        if (result?.status === 409 && result.body?.code === "session_already_ended") {
+        const ended = result?.status === 409 && result.body?.code === "session_already_ended"
+        // A refusal only releases an identity this attempt introduced; a failed
+        // renewal of an owned session still needs its /end unless it already ended.
+        if (result && !result.ok && (!owned || ended)) cleanup.delete(candidate)
+        if (ended) {
           ordinal++
           continue
         }
@@ -817,10 +821,11 @@ export const Engram: Plugin = async (ctx) => {
       // forget with short timeouts — any failure silently skips the nudge.
       try {
 			if (!await ensureResolvedProject()) return
-        const sourceSessionID: string = input.sessionID ?? ""
-        const rootID = await resolveAuthoritativeSessionID(sourceSessionID)
-        if (!rootID || subAgentSessions.has(sourceSessionID) || !await ensureSession(rootID)) return
-        const sessionID = effectiveSessions.get(rootID)!.id
+        const rootID: string = input.sessionID ?? ""
+        if (!rootID || invalidSessions.has(rootID) || subAgentSessions.has(rootID)) return
+        // Read-only: never registers. A resumed root is looked up by the
+        // effective session its writes already use.
+        const sessionID = effectiveSessions.get(rootID)?.id ?? rootID
 
         const cooldownSecs = parseInt(process.env.ENGRAM_NUDGE_COOLDOWN_SECS ?? "900", 10)
         const nowSecs = Math.floor(Date.now() / 1000)

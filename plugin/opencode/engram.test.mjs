@@ -354,6 +354,19 @@ test("renewal advances again when another instance ends the effective session", 
   assert.equal(output.args.session_id, "runtime:resume:3")
 })
 
+test("an uncertain renewal failure keeps cleanup ownership of the registered session", async (t) => {
+  let failRenewal = false
+  const runtime = await createRuntime(t, { registrationResponse: (_attempt, id) => id === "runtime"
+    ? registrationFailure("session_already_ended")
+    : failRenewal ? httpResponse({ error: "unavailable" }, false) : httpResponse({ id, status: "created" }) })
+  await runtime.before({ sessionID: "runtime", tool: "mem_save" }, toolOutput())
+  failRenewal = true
+  await assert.rejects(runtime.before({ sessionID: "runtime", tool: "mem_save" }, toolOutput()), /could not confirm/)
+  await runtime.dispose()
+  assert.deepEqual(runtime.requests.filter((r) => r.path.endsWith("/end")).map((r) => r.path),
+    [`/sessions/${encodeURIComponent("runtime:resume:2")}/end`], "a failed renewal must not drop the owned effective session")
+})
+
 test("separate plugin instances converge on the same resumed identity", async (t) => {
   const options = { registrationResponse: (_attempt, id) => id === "runtime"
     ? registrationFailure("session_already_ended") : httpResponse({ id, status: "created" }) }
@@ -382,6 +395,9 @@ test("resumed save nudge looks up the effective session", async (t) => {
     ? registrationFailure("session_already_ended") : httpResponse({ id, status: "created" }),
     nudgeSessionResponse: { started_at: "2020-01-01 00:00:00" }, nudgeObservationsResponse: [] })
   const output = { system: [] }
+  await runtime.transform({ sessionID: "runtime" }, { system: [] })
+  assert.equal(runtime.registeredIDs.length, 0, "the nudge never registers a session")
+  await runtime.before({ sessionID: "runtime", tool: "mem_save" }, toolOutput())
   await runtime.transform({ sessionID: "runtime" }, output)
   assert.ok(runtime.requests.some((r) => r.path === "/sessions/runtime%3Aresume%3A2"))
   assert.match(output.system.join(""), /MEMORY REMINDER/)
