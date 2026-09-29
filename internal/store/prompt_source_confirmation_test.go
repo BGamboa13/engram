@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -150,6 +151,61 @@ func TestConfirmPromptSourceAttestation(t *testing.T) {
 	if err := confirm(one, preview, "alpha", 49); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestLookupPromptSourceConfirmation(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("session", "owner", "/work"); err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := s.AddPromptWithResult(AddPromptParams{SessionID: "session", SourceInboxID: "inbox", Project: "prompt", Content: "text"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var key string
+	if err := s.DB().QueryRow(`SELECT sync_id FROM user_prompts WHERE id=?`, id).Scan(&key); err != nil {
+		t.Fatal(err)
+	}
+	p, ok, err := s.PreviewPromptSource(key)
+	if err != nil || !ok {
+		t.Fatalf("preview: %v %v", ok, err)
+	}
+	target := "https://one.example"
+	check := func(target string, want, rejected bool) {
+		t.Helper()
+		got, owner, audit, found, err := s.LookupPromptSourceConfirmation(target, key)
+		if want {
+			if err != nil || !found || got != p || owner != "owner" || audit != 42 {
+				t.Fatalf("lookup: %+v %q %d %v %v", got, owner, audit, found, err)
+			}
+		} else if found || (rejected && !errors.Is(err, ErrPromptSourceConfirmation)) || (!rejected && err != nil) {
+			t.Fatalf("unexpected lookup: %+v %q %d found=%v err=%v", got, owner, audit, found, err)
+		}
+	}
+	check(target, false, false) // A prompt and session alone never grant confirmation.
+	if err := s.ConfirmPromptSourceAttestation(target, p, "owner", 42); err != nil {
+		t.Fatal(err)
+	}
+	check(target, true, false)
+	check("https://other.example", false, false)
+	if _, err := s.DB().Exec(`UPDATE user_prompts SET source_inbox_id='changed' WHERE sync_id=?`, key); err != nil {
+		t.Fatal(err)
+	}
+	check(target, false, true)
+	if _, err := s.DB().Exec(`UPDATE user_prompts SET source_inbox_id='inbox' WHERE sync_id=?`, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`UPDATE sessions SET project='other' WHERE id='session'`); err != nil {
+		t.Fatal(err)
+	}
+	check(target, false, true)
+	if _, err := s.DB().Exec(`UPDATE sessions SET project='owner' WHERE id='session'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO prompt_tombstones(sync_id,session_id,source_inbox_id,project) VALUES (?,?,?,?)`, key, p.SessionID, p.SourceInboxID, p.Project); err != nil {
+		t.Fatal(err)
+	}
+	check(target, false, true)
 }
 
 func TestConfirmDeletedPromptWithoutSession(t *testing.T) {
