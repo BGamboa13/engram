@@ -65,6 +65,10 @@ engram cloud config --clear
 
 `cloud config --clear` clears only the persisted `cloud.json` server URL and token. Active `ENGRAM_CLOUD_SERVER` and `ENGRAM_CLOUD_TOKEN` overrides remain effective and are reported by the command and status output; unset them separately when you need them inactive.
 
+## Prompt source attestation did not complete
+
+`engram cloud attest-prompt-source --sync-id <exact-sync-id> --owner-project <owner-project>` requires a configured cloud endpoint and human bearer token. If the local preview is absent or ambiguous, verify the exact sync ID; no remote request is sent. A declined or invalid confirmation also sends nothing. A remote denial can mean either project grant is missing: check both grants with your cloud administrator rather than treating the prompt project as ownership proof. If the remote call succeeds but local confirmation fails, the error includes the remote attestation ID; **do not assume local authorization**. Resolve the local mismatch and retry deliberately. No import, pull, or deletion is part of this command.
+
 ## Cloud project was recreated or deleted
 
 When a project's cloud data was deleted or recreated while the correct local data is already acknowledged, replay the current local project state with:
