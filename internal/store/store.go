@@ -3920,6 +3920,50 @@ func (s *Store) AddPromptWithResult(p AddPromptParams) (int64, bool, error) {
 	return promptID, inserted, nil
 }
 
+// PromptSourcePreview describes observed prompt data, not ownership or authority.
+type PromptSourcePreview struct {
+	SessionID     string
+	SourceInboxID string
+	Project       string
+	SyncID        string
+	Kind          string // live or deleted
+}
+
+// PreviewPromptSource reads one exact sync ID from live prompts or tombstones.
+// Ambiguous or incomplete observations return no preview; project is prompt data only.
+func (s *Store) PreviewPromptSource(syncID string) (PromptSourcePreview, bool, error) {
+	if strings.TrimSpace(syncID) == "" {
+		return PromptSourcePreview{}, false, nil
+	}
+	rows, err := s.db.Query(`SELECT ifnull(session_id,''), ifnull(source_inbox_id,''), ifnull(project,''), ifnull(sync_id,''), 'live'
+		FROM user_prompts WHERE sync_id = ?
+		UNION ALL
+		SELECT ifnull(session_id,''), ifnull(source_inbox_id,''), ifnull(project,''), ifnull(sync_id,''), 'deleted'
+		FROM prompt_tombstones WHERE sync_id = ? LIMIT 2`, syncID, syncID)
+	if err != nil {
+		return PromptSourcePreview{}, false, err
+	}
+	defer func() { _ = rows.Close() }()
+	var preview PromptSourcePreview
+	if !rows.Next() {
+		return preview, false, rows.Err()
+	}
+	if err := rows.Scan(&preview.SessionID, &preview.SourceInboxID, &preview.Project, &preview.SyncID, &preview.Kind); err != nil {
+		return PromptSourcePreview{}, false, err
+	}
+	if rows.Next() {
+		return PromptSourcePreview{}, false, nil
+	}
+	if err := rows.Err(); err != nil {
+		return PromptSourcePreview{}, false, err
+	}
+	if strings.TrimSpace(preview.SessionID) == "" || strings.TrimSpace(preview.SourceInboxID) == "" ||
+		strings.TrimSpace(preview.Project) == "" || strings.TrimSpace(preview.SyncID) == "" {
+		return PromptSourcePreview{}, false, nil
+	}
+	return preview, true, nil
+}
+
 // LocalPromptCreationIdentity returns verified local creation identity by exact sync ID.
 // A tombstone is eligible only when its separately recorded local origin matches.
 func (s *Store) LocalPromptCreationIdentity(syncID string) (session, inbox, project string, eligible bool, err error) {

@@ -2,6 +2,96 @@ package store
 
 import "testing"
 
+func TestPreviewPromptSource(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("session", "alpha", "/work"); err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := s.AddPromptWithResult(AddPromptParams{SessionID: "session", Project: "beta", SourceInboxID: "local", Content: "local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var key string
+	if err := s.DB().QueryRow(`SELECT sync_id FROM user_prompts WHERE id=?`, id).Scan(&key); err != nil {
+		t.Fatal(err)
+	}
+	type previewCase struct {
+		name, key string
+		want      PromptSourcePreview
+		found     bool
+	}
+	cases := []previewCase{
+		{"verified local", key, PromptSourcePreview{"session", "local", "beta", key, "live"}, true},
+		{"missing", "missing", PromptSourcePreview{}, false},
+		{"near-match sync ID", key + "-other", PromptSourcePreview{}, false},
+		{"empty key", "", PromptSourcePreview{}, false},
+	}
+	check := func(tc previewCase) {
+		t.Helper()
+		t.Run(tc.name, func(t *testing.T) {
+			got, found, err := s.PreviewPromptSource(tc.key)
+			if err != nil || found != tc.found || got != tc.want {
+				t.Fatalf("preview %q: got %+v, found %v, err %v; want %+v, found %v", tc.key, got, found, err, tc.want, tc.found)
+			}
+		})
+	}
+	for _, tc := range cases {
+		check(tc)
+	}
+	if _, err := s.DB().Exec(`UPDATE user_prompts SET local_creation_session_id=NULL,local_creation_inbox_id=NULL,local_creation_project=NULL WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	check(previewCase{"unmarked local row", key, cases[0].want, true})
+
+	fixtures := []struct {
+		name, statement string
+	}{
+		{"old imported-style row", `INSERT INTO user_prompts(sync_id,session_id,source_inbox_id,project,content) VALUES ('old','session','old-key','beta','old')`},
+		{"tombstone", `INSERT INTO prompt_tombstones(sync_id,session_id,source_inbox_id,project) VALUES ('deleted','session','gone','beta')`},
+		{"duplicate live", `INSERT INTO user_prompts(sync_id,session_id,source_inbox_id,project,content) VALUES ('old','session','second','beta','duplicate')`},
+		{"live plus tombstone", `INSERT INTO user_prompts(sync_id,session_id,source_inbox_id,project,content) VALUES ('deleted','session','live','beta','conflict')`},
+		{"idless", `INSERT INTO user_prompts(sync_id,session_id,project,content) VALUES ('idless','session','beta','idless')`},
+		{"blank project", `INSERT INTO user_prompts(sync_id,session_id,source_inbox_id,project,content) VALUES ('blank-project','session','inbox','','blank')`},
+		{"blank session", `INSERT INTO prompt_tombstones(sync_id,session_id,source_inbox_id,project) VALUES ('blank-session','','inbox','beta')`},
+		{"whitespace-only identity", `INSERT INTO prompt_tombstones(sync_id,session_id,source_inbox_id,project) VALUES ('whitespace-identity','   ','  ','  ')`},
+	}
+	for i, fixture := range fixtures {
+		if _, err := s.DB().Exec(fixture.statement); err != nil {
+			t.Fatalf("%s: %v", fixture.name, err)
+		}
+		if i == 0 {
+			check(previewCase{fixture.name, "old", PromptSourcePreview{"session", "old-key", "beta", "old", "live"}, true})
+		}
+		if i == 1 {
+			check(previewCase{fixture.name, "deleted", PromptSourcePreview{"session", "gone", "beta", "deleted", "deleted"}, true})
+		}
+	}
+	for _, tc := range []previewCase{
+		{"duplicate live", "old", PromptSourcePreview{}, false},
+		{"live plus tombstone", "deleted", PromptSourcePreview{}, false},
+		{"idless", "idless", PromptSourcePreview{}, false},
+		{"blank project", "blank-project", PromptSourcePreview{}, false},
+		{"blank session", "blank-session", PromptSourcePreview{}, false},
+		{"whitespace-only identity", "whitespace-identity", PromptSourcePreview{}, false},
+	} {
+		check(tc)
+	}
+	var originCount int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM user_prompts WHERE id=? AND local_creation_session_id IS NULL AND local_creation_inbox_id IS NULL AND local_creation_project IS NULL`, id).Scan(&originCount); err != nil || originCount != 1 {
+		t.Fatalf("origin changed: %d %v", originCount, err)
+	}
+}
+
+func TestPreviewPromptSourceDBError(t *testing.T) {
+	s := newTestStore(t) // isolated temp database; schema damage cannot affect another test.
+	if _, err := s.DB().Exec(`DROP TABLE prompt_tombstones`); err != nil {
+		t.Fatal(err)
+	}
+	if got, found, err := s.PreviewPromptSource("missing"); err == nil || found || got != (PromptSourcePreview{}) {
+		t.Fatalf("DB error: %+v %v %v", got, found, err)
+	}
+}
+
 func TestLocalPromptCreationIdentity(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("session", "alpha", "/work"); err != nil {
