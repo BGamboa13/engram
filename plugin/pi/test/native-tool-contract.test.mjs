@@ -2945,3 +2945,39 @@ test("registered Pi-native mem_pin and mem_unpin target the observation pin rout
     else process.env.ENGRAM_URL = originalUrl;
   }
 });
+
+test("automatic prompt capture redacts a private block that straddles the truncation limit", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalUrl = process.env.ENGRAM_URL;
+  const calls = [];
+  process.env.ENGRAM_URL = "http://127.0.0.1:17437";
+  globalThis.fetch = async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    calls.push({ method: init.method ?? "GET", path, body });
+    if (path === "/health") return new Response(JSON.stringify({ status: "ok" }));
+    if (path === "/project/current") return new Response(JSON.stringify({ project: "engram" }));
+    if (path === "/sessions") return new Response(JSON.stringify({ status: "created" }), { status: 201 });
+    if (path === "/prompts") return new Response(JSON.stringify({ id: 1 }), { status: 201 });
+    return new Response(JSON.stringify({}));
+  };
+
+  try {
+    await withPluginSandbox("engram-pi-contract-", async ({ sandbox }) => {
+      const { eventHandlers } = await loadPluginHarness(sandbox);
+      await eventHandlers.get("before_agent_start")(
+        { systemPrompt: "base", prompt: `${"a".repeat(1980)}<private>PIN=42</private> trailing` },
+        runtimeContext("straddle-session"),
+      );
+    });
+
+    const prompts = calls.filter((call) => call.method === "POST" && call.path === "/prompts");
+    assert.equal(prompts.length, 1, "the prompt must still be captured");
+    assert.equal(JSON.stringify(prompts[0].body).includes("PIN=42"), false, "private content must never reach the wire");
+    assert.match(prompts[0].body.content, /\[REDACTED\]/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalUrl === undefined) delete process.env.ENGRAM_URL;
+    else process.env.ENGRAM_URL = originalUrl;
+  }
+});
