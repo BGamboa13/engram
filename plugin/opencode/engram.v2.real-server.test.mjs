@@ -140,9 +140,9 @@ test("V2 inbox prompts stay idempotent and deleted across real server restarts",
   }
   process.env.ENGRAM_URL = PLUGIN_URL
 
-  const events = eventStream()
+  let events = eventStream()
   const module = await import(new URL("./engram.ts?v2-real-server", import.meta.url).href)
-  cleanup = await module.default.setup({
+  const setup = () => module.default.setup({
     location: { directory: dir, project: { id: PROJECT_ID } },
     event: { subscribe: (options) => events.subscribe(options) },
     session: {
@@ -151,6 +151,8 @@ test("V2 inbox prompts stay idempotent and deleted across real server restarts",
     },
     tool: { hook: async () => ({ dispose: async () => {} }) },
   })
+
+  cleanup = await setup()
 
   const text = "Rotate the staging credentials before the release"
   const enqueue = (inboxID) => events.emit({
@@ -197,4 +199,16 @@ test("V2 inbox prompts stay idempotent and deleted across real server restarts",
   await enqueue("msg_inbox_x")
   assert.equal(promptResponses.at(-1).status, 409)
   assert.equal((await prompts()).length, 1, "deletion survives a restart")
+
+  for (const suffix of [2, 3]) {
+    await cleanup()
+    events = eventStream()
+    cleanup = await setup()
+    await enqueue(`msg_resumed_${suffix}`)
+    const captured = promptResponses.at(-1)
+    assert.equal(captured.status, 201)
+    assert.equal(captured.session_id, `ses_root:resume:${suffix}`)
+    assert.equal(captured.source_inbox_id, `msg_resumed_${suffix}`)
+    assert.ok((await prompts()).some((prompt) => prompt.session_id === captured.session_id))
+  }
 })

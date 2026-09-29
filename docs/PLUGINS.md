@@ -49,6 +49,8 @@ The same `engram.ts` supports OpenCode 1.x (1.18.29+) and 2.x. Its default expor
 
 > **Local model compatibility:** The plugin works with all models, including local ones served via llama.cpp, Ollama, or similar. The Memory Protocol is concatenated into the existing system prompt (not added as a separate system message), so models with strict Jinja templates (Qwen, Mistral/Ministral) work correctly.
 
+When an OpenCode conversation resumes after its Engram session has ended, the plugin registers a distinct effective identity before writing; ended rows remain closed. Both majors probe the root ID, then `<root>:resume:2` through `<root>:resume:32`, and cache the acknowledged identity for the process without persistence. Prompts, passive capture, attributed MCP writes, session lookups, compaction context, and disposal use that effective identity. Concurrent instances converge on the first live identity. Only `409 session_already_ended` advances the probe; ownership conflicts and other failures refuse writes, warn once per root, and require correcting the cause or starting a new OpenCode session.
+
 ### What the Plugin Does
 
 The plugin:

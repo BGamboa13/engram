@@ -131,7 +131,7 @@ async function waitFor(condition, message, ms = 1000) {
   }
 }
 
-async function setupV2(t, { sessions = new Map(), promptResponse } = {}) {
+async function setupV2(t, { sessions = new Map(), promptResponse, registrationResponse } = {}) {
   const originalFetch = globalThis.fetch
   const originalBun = globalThis.Bun
   const originalEngramURL = process.env.ENGRAM_URL
@@ -152,7 +152,7 @@ async function setupV2(t, { sessions = new Map(), promptResponse } = {}) {
     const body = init?.body ? JSON.parse(init.body) : undefined
     requests.push({ path, method: init?.method, body })
     if (path === "/project/current") return httpResponse({ project: "engram", project_source: "git_remote" })
-    if (path === "/sessions") return httpResponse({ id: body.id, status: "created" })
+    if (path === "/sessions") return registrationResponse ? registrationResponse(body) : httpResponse({ id: body.id, status: "created" })
     if (path === "/context/compaction") return httpResponse({ context: "previous session context" })
     if (path === "/prompts" && promptResponse) return promptResponse(body)
     return httpResponse({})
@@ -220,6 +220,19 @@ async function setupV2(t, { sessions = new Map(), promptResponse } = {}) {
 function sessionInfo(id, parentID) {
   return { id, projectID: PROJECT_ID, ...(parentID ? { parentID } : {}) }
 }
+
+test("V2 resumed inbox capture retains durable source identity", async (t) => {
+  const runtime = await setupV2(t, {
+    sessions: new Map([["ses_root", sessionInfo("ses_root")]]),
+    registrationResponse: ({ id }) => id === "ses_root"
+      ? httpResponse({ code: "session_already_ended" }, 409) : httpResponse({ id, status: "created" }),
+  })
+  await runtime.enqueued("ses_root", "inbox-resumed", { type: "user", payload: { text: "Continue this conversation after restart" }, delivery: "queue" })
+  assert.equal(runtime.posts("/prompts")[0].body.session_id, "ses_root:resume:2")
+  assert.equal(runtime.posts("/prompts")[0].body.source_inbox_id, "inbox-resumed")
+  await runtime.cleanup()
+  assert.equal(runtime.posts("/sessions/ses_root%3Aresume%3A2/end").length, 1)
+})
 
 test("default export serves V1 through server and V2 through setup", async () => {
   const module = await import(new URL("./engram.ts?v2-shape", import.meta.url).href)
