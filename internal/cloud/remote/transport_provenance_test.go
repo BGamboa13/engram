@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -87,6 +88,83 @@ func TestMutationProvenanceRejectsUnverifiedSuccess(t *testing.T) {
 				t.Fatal("accepted response without confirmed claim")
 			}
 		})
+	}
+}
+
+func TestAttestPromptSource(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if r.Method != http.MethodPost || r.URL.Path != "/sync/prompt-source-attestations" || r.Header.Get("Authorization") != "Bearer secret" || r.Header.Get("Content-Type") != "application/json" || string(body) != `{"session_id":"s","source_inbox_id":"i","sync_id":"y","owner_project":"owner","prompt_project":"prompt"}` {
+			t.Errorf("unexpected attestation request: method=%s path=%s body=%q", r.Method, r.URL.Path, body)
+		}
+		_, _ = w.Write([]byte(`{"status":"ok","attestation_id":42}`))
+	}))
+	defer server.Close()
+	mt := mustNewMutationTransport(t, server.URL, "secret")
+	mt.httpClient = server.Client()
+	id, err := mt.AttestPromptSource("s", "i", "y", "owner", "prompt")
+	if err != nil || id != 42 {
+		t.Fatalf("id=%d err=%v", id, err)
+	}
+}
+
+func TestAttestPromptSourceRejectsInvalidResponse(t *testing.T) {
+	for _, body := range []string{"", `{}`, `{"status":"ok"}`, `{"status":"pending","attestation_id":1}`, `{"status":"ok","attestation_id":0}`, `{"status":"ok","attestation_id":-1}`, `{"status":"ok","attestation_id":"1"}`, `{"status":"ok","attestation_id":1} {}`} {
+		t.Run(body, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) }))
+			defer server.Close()
+			mt := mustNewMutationTransport(t, server.URL, "")
+			if id, err := mt.AttestPromptSource("s", "i", "y", "owner", "prompt"); err == nil || id != 0 {
+				t.Fatalf("id=%d err=%v", id, err)
+			}
+		})
+	}
+}
+
+func TestAttestPromptSourceStatusRedactsToken(t *testing.T) {
+	for _, code := range []int{401, 403, 404, 409} {
+		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(code)
+			_, _ = w.Write([]byte(`{"error":"secret","error_code":"secret"}`))
+		}))
+		mt := mustNewMutationTransport(t, server.URL, "secret")
+		mt.httpClient = server.Client()
+		_, err := mt.AttestPromptSource("s", "i", "y", "owner", "prompt")
+		var status *HTTPStatusError
+		if !errors.As(err, &status) || status.StatusCode != code || strings.Contains(err.Error(), "secret") || strings.Contains(status.Body, "secret") {
+			t.Errorf("code=%d status=%+v err=%v", code, status, err)
+		}
+		server.Close()
+	}
+}
+
+func TestAttestPromptSourceInvalidInputAndOversizedResponse(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		_, _ = w.Write([]byte(`{"status":"ok","attestation_id":1,"padding":"` + strings.Repeat("x", 65536) + `"}`))
+	}))
+	defer server.Close()
+	mt := mustNewMutationTransport(t, server.URL, "")
+	if _, err := mt.AttestPromptSource(" ", "i", "y", "owner", "prompt"); err == nil || requests != 0 {
+		t.Fatalf("invalid input sent request: requests=%d err=%v", requests, err)
+	}
+	if _, err := mt.AttestPromptSource("s", "i", "y", "owner", "prompt"); err == nil || requests != 1 {
+		t.Fatalf("oversized response accepted: requests=%d err=%v", requests, err)
+	}
+}
+
+func TestAttestPromptSourceNetworkFailureRedactsToken(t *testing.T) {
+	mt := mustNewMutationTransport(t, "https://cloud.example.test", "secret")
+	mt.httpClient = &http.Client{Transport: remoteRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("network failure with bearer secret")
+	})}
+	id, err := mt.AttestPromptSource("s", "i", "y", "owner", "prompt")
+	if err == nil || id != 0 {
+		t.Fatalf("id=%d err=%v", id, err)
+	}
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("network error leaked bearer token: %v", err)
 	}
 }
 
