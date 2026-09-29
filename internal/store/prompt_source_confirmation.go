@@ -9,6 +9,68 @@ import (
 
 var ErrPromptSourceConfirmation = errors.New("prompt source confirmation rejected")
 
+// LookupPromptSourceConfirmation reads only an explicit confirmation for this remote target.
+// It rechecks the current prompt tuple and rejects contradictory session ownership;
+// ordinary prompt or session metadata never creates a confirmation.
+func (s *Store) LookupPromptSourceConfirmation(remoteTarget, syncID string) (PromptSourcePreview, string, int64, bool, error) {
+	var preview PromptSourcePreview
+	if strings.TrimSpace(remoteTarget) == "" || strings.TrimSpace(syncID) == "" {
+		return preview, "", 0, false, ErrPromptSourceConfirmation
+	}
+	var owner string
+	var auditID int64
+	err := s.db.QueryRow(`SELECT session_id,source_inbox_id,prompt_project,sync_id,kind,asserted_owner_project,remote_attestation_id
+  FROM prompt_source_confirmations WHERE remote_target=? AND sync_id=?`, remoteTarget, syncID).
+		Scan(&preview.SessionID, &preview.SourceInboxID, &preview.Project, &preview.SyncID, &preview.Kind, &owner, &auditID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PromptSourcePreview{}, "", 0, false, nil
+	}
+	if err != nil {
+		return PromptSourcePreview{}, "", 0, false, err
+	}
+	reject := func() (PromptSourcePreview, string, int64, bool, error) {
+		return PromptSourcePreview{}, "", 0, false, ErrPromptSourceConfirmation
+	}
+	if strings.TrimSpace(preview.SessionID) == "" || strings.TrimSpace(preview.SourceInboxID) == "" || strings.TrimSpace(preview.Project) == "" || strings.TrimSpace(owner) == "" || auditID <= 0 || preview.SyncID != syncID || (preview.Kind != "live" && preview.Kind != "deleted") {
+		return reject()
+	}
+	rows, err := s.db.Query(`SELECT ifnull(session_id,''),ifnull(source_inbox_id,''),ifnull(project,''),ifnull(sync_id,''),'live' FROM user_prompts WHERE sync_id=?
+ UNION ALL SELECT ifnull(session_id,''),ifnull(source_inbox_id,''),ifnull(project,''),ifnull(sync_id,''),'deleted' FROM prompt_tombstones WHERE sync_id=? LIMIT 2`, syncID, syncID)
+	if err != nil {
+		return PromptSourcePreview{}, "", 0, false, err
+	}
+	defer func() { _ = rows.Close() }()
+	var current PromptSourcePreview
+	if !rows.Next() {
+		if err = rows.Err(); err != nil {
+			return PromptSourcePreview{}, "", 0, false, err
+		}
+		return reject()
+	}
+	if err = rows.Scan(&current.SessionID, &current.SourceInboxID, &current.Project, &current.SyncID, &current.Kind); err != nil {
+		return PromptSourcePreview{}, "", 0, false, err
+	}
+	ambiguous := rows.Next()
+	if err = rows.Err(); err != nil {
+		return PromptSourcePreview{}, "", 0, false, err
+	}
+	if ambiguous || current != preview {
+		return reject()
+	}
+	if err = rows.Close(); err != nil {
+		return PromptSourcePreview{}, "", 0, false, err
+	}
+	var sessionOwner string
+	err = s.db.QueryRow(`SELECT project FROM sessions WHERE id=?`, preview.SessionID).Scan(&sessionOwner)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return PromptSourcePreview{}, "", 0, false, err
+	}
+	if err == nil && strings.TrimSpace(sessionOwner) != "" && sessionOwner != owner {
+		return reject()
+	}
+	return preview, owner, auditID, true, nil
+}
+
 // ConfirmPromptSourceAttestation records an explicit owner assertion only after
 // the caller reports remote attestation success. The observed tuple is not
 // ownership proof. A tuple recheck cannot detect change-away-and-back without

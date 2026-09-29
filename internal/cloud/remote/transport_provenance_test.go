@@ -168,6 +168,55 @@ func TestAttestPromptSourceNetworkFailureRedactsToken(t *testing.T) {
 	}
 }
 
+func TestVerifyPromptSourceAttestation(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if r.Method != http.MethodPost || r.URL.Path != "/sync/prompt-source-attestations/verify" || r.Header.Get("Authorization") != "Bearer secret" || r.Header.Get("Content-Type") != "application/json" || string(body) != `{"audit_id":42,"session_id":"s","source_inbox_id":"i","sync_id":"y","owner_project":"owner","prompt_project":"prompt"}` {
+			t.Errorf("unexpected request: %s %s %q", r.Method, r.URL.Path, body)
+		}
+		_, _ = w.Write([]byte(`{"status":"ok","attestation_id":42}`))
+	}))
+	defer server.Close()
+	mt := mustNewMutationTransport(t, server.URL, "secret")
+	mt.httpClient = server.Client()
+	if err := mt.VerifyPromptSourceAttestation(42, "s", "i", "y", "owner", "prompt"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestVerifyPromptSourceAttestationRejectsInvalid(t *testing.T) {
+	for _, body := range []string{"", `{}`, `{"status":"pending","attestation_id":42}`, `{"status":"ok","attestation_id":41}`, `{"status":"ok","attestation_id":0}`, `{"status":"ok","attestation_id":"42"}`, `{"status":"ok","attestation_id":42,"extra":1}`, `{"status":"ok","attestation_id":42} {}`, `{"status":"ok","attestation_id":42,"padding":"` + strings.Repeat("x", 65536) + `"}`} {
+		t.Run(body[:min(len(body), 40)], func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) }))
+			defer server.Close()
+			mt := mustNewMutationTransport(t, server.URL, "")
+			if err := mt.VerifyPromptSourceAttestation(42, "s", "i", "y", "owner", "prompt"); err == nil {
+				t.Fatal("invalid response accepted")
+			}
+		})
+	}
+}
+
+func TestVerifyPromptSourceAttestationRedactsFailures(t *testing.T) {
+	mt := mustNewMutationTransport(t, "https://cloud.example.test", "secret")
+	mt.httpClient = &http.Client{Transport: remoteRoundTripperFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("bearer secret") })}
+	if err := mt.VerifyPromptSourceAttestation(42, "s", "i", "y", "owner", "prompt"); err == nil || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("network error: %v", err)
+	}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(403)
+		_, _ = w.Write([]byte(strings.Repeat("secret", 20000)))
+	}))
+	defer server.Close()
+	mt = mustNewMutationTransport(t, server.URL, "secret")
+	mt.httpClient = server.Client()
+	err := mt.VerifyPromptSourceAttestation(42, "s", "i", "y", "owner", "prompt")
+	var status *HTTPStatusError
+	if !errors.As(err, &status) || status.StatusCode != 403 || strings.Contains(err.Error(), "secret") || len(err.Error()) > 200 {
+		t.Fatalf("status: %v", err)
+	}
+}
+
 func TestMutationProvenanceNetworkFailure(t *testing.T) {
 	mt, err := NewMutationTransport("http://cloud.example.test", "")
 	if err != nil {
