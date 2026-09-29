@@ -211,7 +211,7 @@ async function createRuntime(t, {
 		}
     if (path === "/sessions") {
       registeredIDs.push(body.id)
-      if (registrationResponse) return registrationResponse(registeredIDs.length)
+      if (registrationResponse) return registrationResponse(registeredIDs.length, body.id)
       if (realServerFetch) return originalFetch(url, init)
       return httpResponse({ id: body.id, status: "created" })
     }
@@ -282,6 +282,146 @@ async function createRuntime(t, {
 		startupEvents,
   }
 }
+
+function registrationFailure(code) {
+  return { ...httpResponse({ code }, false), status: 409 }
+}
+
+for (const endedCount of [1, 2]) {
+  test(`ended roots advance to resume:${endedCount + 1} for every session-bound hook`, async (t) => {
+    const runtime = await createRuntime(t, {
+      registrationResponse: () => httpResponse({ id: `runtime:resume:${endedCount + 1}`, status: "created" }),
+      contextResponse: () => httpResponse({ context: "resumed context" }),
+    })
+    const effective = `runtime:resume:${endedCount + 1}`
+    await runtime.chat({ sessionID: "runtime" }, { parts: [{ type: "text", text: "Continue the previous conversation" }], message: {} })
+    await runtime.after({ sessionID: "runtime", tool: "Task" }, "A reusable learning from this completed task that exceeds fifty characters")
+    const output = toolOutput()
+    await runtime.before({ sessionID: "runtime", tool: "engram_mem_save" }, output)
+    assert.equal(output.args.session_id, effective)
+    for (const path of ["/prompts", "/observations/passive"]) {
+      assert.equal(runtime.requests.find((r) => r.path === path).body.session_id, effective)
+    }
+    await runtime.compact({ sessionID: "runtime" }, { context: [] })
+    assert.equal(new URL(runtime.requests.find((r) => r.path === "/context/compaction").url).searchParams.get("session_id"), effective)
+    await runtime.dispose()
+    assert.deepEqual(runtime.requests.filter((r) => r.path.endsWith("/end")).map((r) => r.path), [`/sessions/${encodeURIComponent(effective)}/end`])
+  })
+}
+
+test("concurrent resumed writes share one resume request", async (t) => {
+  const runtime = await createRuntime(t, {
+    registrationResponse: () => httpResponse({ id: "runtime:resume:2", status: "created" }),
+  })
+  const outputs = [toolOutput(), toolOutput(), toolOutput()]
+  await Promise.all(outputs.map((output) => runtime.before({ sessionID: "runtime", tool: "mem_save" }, output)))
+  assert.deepEqual(runtime.registeredIDs, ["runtime"])
+  assert.equal(runtime.requests.find((r) => r.path === "/sessions").body.resume, true)
+  assert.ok(outputs.every((o) => o.args.session_id === "runtime:resume:2"))
+})
+
+for (const code of ["session_project_conflict", "session_already_ended"]) {
+  test(`${code} refuses writes with a specific cause and warns once`, async (t) => {
+    const warnings = []
+    const originalWarn = console.warn
+    console.warn = (message) => warnings.push(message)
+    t.after(() => { console.warn = originalWarn })
+    const runtime = await createRuntime(t, { registrationResponse: () => registrationFailure(code) })
+    for (let i = 0; i < 2; i++) {
+      const output = toolOutput()
+      await assert.rejects(runtime.before({ sessionID: "runtime", tool: "mem_save" }, output), new RegExp(code))
+      assert.equal(output.args.session_id, MODEL_SESSION_ID)
+    }
+    assert.deepEqual(runtime.registeredIDs, ["runtime", "runtime"])
+    assert.equal(warnings.length, 1)
+    await runtime.dispose()
+    assert.equal(runtime.requests.filter((r) => r.path.endsWith("/end")).length, 0, "rejected registrations do not own cleanup")
+  })
+}
+
+test("renewal advances again when another instance ends the effective session", async (t) => {
+  let effective = "runtime:resume:2"
+  const runtime = await createRuntime(t, { registrationResponse: () => httpResponse({ id: effective, status: "created" }) })
+  const output = toolOutput()
+  await runtime.before({ sessionID: "runtime", tool: "mem_save" }, output)
+  effective = "runtime:resume:3"
+  await runtime.before({ sessionID: "runtime", tool: "mem_save" }, output)
+  assert.equal(output.args.session_id, "runtime:resume:3")
+})
+
+test("an uncertain renewal failure keeps cleanup ownership of the registered session", async (t) => {
+  let failRenewal = false
+  const runtime = await createRuntime(t, { registrationResponse: () => failRenewal
+    ? httpResponse({ error: "unavailable" }, false) : httpResponse({ id: "runtime:resume:2", status: "created" }) })
+  await runtime.before({ sessionID: "runtime", tool: "mem_save" }, toolOutput())
+  failRenewal = true
+  await assert.rejects(runtime.before({ sessionID: "runtime", tool: "mem_save" }, toolOutput()), /could not confirm/)
+  await runtime.dispose()
+  assert.deepEqual(runtime.requests.filter((r) => r.path.endsWith("/end")).map((r) => r.path),
+    [`/sessions/${encodeURIComponent("runtime:resume:2")}/end`], "a failed renewal must not drop the owned effective session")
+})
+
+test("an uncertain initial resume never guesses a cleanup identity", async (t) => {
+  const runtime = await createRuntime(t, { registrationResponse: () => httpResponse({}, true, undefined, new Error("lost acknowledgement")) })
+  await assert.rejects(runtime.before({ sessionID: "runtime", tool: "mem_save" }, toolOutput()), /could not confirm/)
+  await runtime.dispose()
+  assert.deepEqual(runtime.registeredIDs, ["runtime"])
+  assert.equal(runtime.requests.filter((r) => r.path.endsWith("/end")).length, 0)
+})
+
+test("a timed-out registration followed by refusal never guesses an effective ID", async (t) => {
+  const runtime = await createRuntime(t, {
+    registrationResponse: (attempt) => {
+      if (attempt === 1) throw new Error("registration timed out")
+      return registrationFailure("session_already_ended")
+    },
+  })
+  for (const error of [/could not confirm/, /session_already_ended/]) {
+    const output = toolOutput()
+    await assert.rejects(runtime.before({ sessionID: "runtime", tool: "mem_save" }, output), error)
+    assert.equal(output.args.session_id, MODEL_SESSION_ID, "no MCP session_id is injected without an acknowledgement")
+  }
+  await runtime.chat({ sessionID: "runtime" }, { parts: [{ type: "text", text: "Continue the conversation" }], message: {} })
+  await runtime.after({ sessionID: "runtime", tool: "Task" }, "A reusable learning from this completed task that exceeds fifty characters")
+  assert.ok(runtime.registeredIDs.length >= 2)
+  assert.ok(runtime.registeredIDs.every((id) => id === "runtime"), "registration never invents a continuation ID")
+  assert.equal(runtime.requests.filter((r) => ["/prompts", "/observations/passive"].includes(r.path)).length, 0, "refused sessions accept no writes")
+  await runtime.dispose()
+  assert.equal(runtime.requests.filter((r) => r.path.endsWith("/end")).length, 0, "dispose never ends an unacknowledged or guessed ID")
+})
+
+test("separate plugin instances converge on the same resumed identity", async (t) => {
+  const options = { registrationResponse: () => httpResponse({ id: "runtime:resume:2", status: "created" }) }
+  const first = await createRuntime(t, options)
+  await t.test("second instance", async (t) => {
+    const second = await createRuntime(t, options)
+    const outputs = [toolOutput(), toolOutput()]
+    await Promise.all([first, second].map((runtime, i) => runtime.before({ sessionID: "runtime", tool: "mem_save" }, outputs[i])))
+    assert.ok(outputs.every((o) => o.args.session_id === "runtime:resume:2"))
+  })
+})
+
+test("unknown refusals and mismatched resumed acknowledgements never advance", async (t) => {
+  for (const response of [registrationFailure("other_conflict"), httpResponse({ id: "foreign", status: "created" }), httpResponse({ id: "runtime-other:resume:2", status: "created" }), httpResponse({ id: "runtime:resume:2", status: "rejected" }), httpResponse({}, false)]) {
+    await t.test(JSON.stringify(response), async (t) => {
+      const runtime = await createRuntime(t, { registrationResponse: () => response })
+      await assert.rejects(runtime.before({ sessionID: "runtime", tool: "mem_save" }, toolOutput()), /could not confirm/)
+      assert.deepEqual(runtime.registeredIDs, ["runtime"])
+    })
+  }
+})
+
+test("resumed save nudge looks up the effective session", async (t) => {
+  const runtime = await createRuntime(t, { registrationResponse: () => httpResponse({ id: "runtime:resume:2", status: "created" }),
+    nudgeSessionResponse: { started_at: "2020-01-01 00:00:00" }, nudgeObservationsResponse: [] })
+  const output = { system: [] }
+  await runtime.transform({ sessionID: "runtime" }, { system: [] })
+  assert.equal(runtime.registeredIDs.length, 0, "the nudge never registers a session")
+  await runtime.before({ sessionID: "runtime", tool: "mem_save" }, toolOutput())
+  await runtime.transform({ sessionID: "runtime" }, output)
+  assert.ok(runtime.requests.some((r) => r.path === "/sessions/runtime%3Aresume%3A2"))
+  assert.match(output.system.join(""), /MEMORY REMINDER/)
+})
 
 test("V1 default selection initializes only the Engram factory once", async (t) => {
   const runtime = await createRuntime(t, { selectLegacyDefault: true })
@@ -603,7 +743,7 @@ test("OpenCode activity renews a cached root session once per activity wave", as
 test("write tool hook binds only the four attributed writes to authoritative runtime identity", () => {
   assert.match(source, /SESSION_ATTRIBUTED_WRITE_TOOLS = new Set\(\[[\s\S]*"mem_save"[\s\S]*"mem_save_prompt"[\s\S]*"mem_session_summary"[\s\S]*"mem_capture_passive"/)
   assert.match(source, /"tool.execute.before"/)
-  assert.match(source, /output\.args\.session_id = authoritativeSessionID/)
+  assert.match(source, /output\.args\.session_id = effectiveSessions\.get\(authoritativeSessionID\)!\.id/)
   assert.doesNotMatch(source, /delete output\.args\.session_id/)
   assert.match(source, /throw new Error/)
   assert.doesNotMatch(source, /knownSessions\.add\(sessionId\)[\s\S]{0,160}await engramFetch\("\/sessions"/)
@@ -926,7 +1066,7 @@ test("write tool hook revalidates leaf and ancestor ownership after registration
       const pending = runtime.before({ tool: "mem_save", sessionID: "leaf" }, output)
       await registration.started
       const mutation = scenario.mutate(runtime)
-      registration.resolve(httpResponse())
+      registration.resolve(httpResponse({ id: "old-root", status: "created" }))
 
       await Promise.all([mutation, assertNoForward(pending, output)])
       if (scenario.name === "root ancestor deleted")
@@ -1247,7 +1387,7 @@ test("plugin disposal closes registered roots, not children, and waits for sessi
 
 // OpenCode owns the hook, not the external MCP tool wrapper. Forwarding below models only
 // that wrapper's HTTP POST after the exported hook has rewritten its arguments.
-test("OpenCode host bindings survive real server persistence and reject ended registration", async (t) => {
+test("OpenCode host bindings survive real server persistence and replace ended registration", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "engram-opencode-real-"))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   t.after(() => assert.equal(fs.existsSync(dir), false, `test directory remains: ${dir}`))
@@ -1340,11 +1480,11 @@ test("OpenCode host bindings survive real server persistence and reject ended re
       body: JSON.stringify({ id: ids[0], project: "engram", directory: dir }),
     })
     assert.equal(conflict.status, 409, "the real server refuses ended registration")
-    const denied = { args: { title: "must-not-persist", content: "denied", session_id: "model-conflict" } }
+    const resumed = { args: { title: "resumed", content: "resumed", session_id: "model-conflict" } }
     const postsBefore = observationPosts
-    await assert.rejects(runtime.before({ tool: "mem_save", sessionID: ids[0] }, denied), /could not confirm Engram session registration/)
-    assert.equal(denied.args.session_id, "model-conflict")
-    assert.equal(observationPosts, postsBefore, "rejected hook must stop before external MCP forwarding")
+    await runtime.before({ tool: "mem_save", sessionID: ids[0] }, resumed)
+    assert.equal(resumed.args.session_id, `${ids[0]}:resume:2`)
+    assert.equal(observationPosts, postsBefore, "registration does not itself forward an observation")
     assert.equal((await persisted()).length, 4)
   } finally {
     lines.close()

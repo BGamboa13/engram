@@ -26,6 +26,137 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func TestCreateSessionResume(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	post := func(body string, code int, id, from string) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(body)))
+		if rec.Code != code {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		var ack map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &ack); err != nil {
+			t.Fatal(err)
+		}
+		if code == 201 && (ack["id"] != id || ack["status"] != "created" || ack["resumed_from"] != from) {
+			t.Fatalf("ack: %v", ack)
+		}
+		if code == 409 && ack["code"] != "session_already_ended" {
+			t.Fatal(ack)
+		}
+	}
+	post(`{"id":"root","project":"engram","resume":true}`, 201, "root", "")
+	post(`{"id":"root","project":"engram","resume":true}`, 201, "root", "")
+	if err := st.EndSession("root", ""); err != nil {
+		t.Fatal(err)
+	}
+	post(`{"id":"root","project":"engram"}`, 409, "", "")
+	post(`{"id":"root","project":"engram","resume":false}`, 409, "", "")
+	post(`{"id":"root","project":"engram","resume":true}`, 201, "root:resume:2", "root")
+	post(`{"id":"root","project":"engram","resume":true}`, 201, "root:resume:2", "root")
+	if err := st.EndSession("root:resume:2", ""); err != nil {
+		t.Fatal(err)
+	}
+	post(`{"id":"root","project":"engram","resume":true}`, 201, "root:resume:3", "root")
+	post(`{"id":"root","project":"engram","resume":"yes"}`, 400, "", "")
+}
+
+func TestCreateSessionResumeConflict(t *testing.T) {
+	for _, mode := range []string{store.SessionOwnershipShared, store.SessionOwnershipProjectOwned} {
+		t.Run(mode, func(t *testing.T) {
+			st := newServerTestStore(t)
+			srv := New(st, 0)
+			if err := st.StartSession("root", "engram", "/work"); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.EndSession("root", ""); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.StartSessionWithOwnershipMode("root:resume:2", "foreign", "/work", store.SessionOwnershipProjectOwned); err != nil {
+				t.Fatal(err)
+			}
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(fmt.Sprintf(`{"id":"root","project":"engram","resume":true,"ownership_mode":%q}`, mode))))
+			var ack map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &ack); err != nil {
+				t.Fatal(err)
+			}
+			if rec.Code != 409 || ack["code"] != "session_project_conflict" || ack["session_id"] != "root:resume:2" || ack["owner_project"] != "foreign" || ack["requested_project"] != "engram" {
+				t.Fatalf("conflict: %d %v", rec.Code, ack)
+			}
+			if _, err := st.GetSession("root:resume:3"); err == nil {
+				t.Fatal("advanced past conflict")
+			}
+		})
+	}
+}
+
+func TestCreateSessionResumeEndedRootProjectConflict(t *testing.T) {
+	for _, mode := range []string{store.SessionOwnershipProjectOwned, store.SessionOwnershipShared} {
+		for _, continuation := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/continuation=%v", mode, continuation), func(t *testing.T) {
+				st := newServerTestStore(t)
+				if err := st.StartSessionWithOwnershipMode("root", "project-a", "/work", store.SessionOwnershipProjectOwned); err != nil {
+					t.Fatal(err)
+				}
+				if err := st.EndSession("root", "done"); err != nil {
+					t.Fatal(err)
+				}
+				if continuation {
+					if err := st.StartSessionWithOwnershipMode("root:resume:2", "project-b", "/work", mode); err != nil {
+						t.Fatal(err)
+					}
+				}
+				rec := httptest.NewRecorder()
+				New(st, 0).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(fmt.Sprintf(`{"id":"root","project":"project-b","resume":true,"ownership_mode":%q}`, mode))))
+				var ack map[string]string
+				if err := json.Unmarshal(rec.Body.Bytes(), &ack); err != nil {
+					t.Fatal(err)
+				}
+				if rec.Code != http.StatusConflict || ack["code"] != "session_project_conflict" || ack["session_id"] != "root" || ack["owner_project"] != "project-a" || ack["requested_project"] != "project-b" {
+					t.Fatalf("root conflict: %d %v", rec.Code, ack)
+				}
+				if !continuation {
+					if _, err := st.GetSession("root:resume:2"); err == nil {
+						t.Fatal("created continuation despite root conflict")
+					}
+				}
+				if _, err := st.GetSession("root:resume:3"); err == nil {
+					t.Fatal("advanced past root conflict")
+				}
+			})
+		}
+	}
+}
+
+func TestCreateSessionResumeConcurrent(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	if err := st.StartSession("root", "engram", "/work"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EndSession("root", ""); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan bool, 16)
+	for i := 0; i < 16; i++ {
+		go func() {
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(`{"id":"root","project":"engram","resume":true}`)))
+			var ack map[string]string
+			err := json.Unmarshal(rec.Body.Bytes(), &ack)
+			done <- err == nil && rec.Code == 201 && ack["id"] == "root:resume:2" && ack["resumed_from"] == "root"
+		}()
+	}
+	for i := 0; i < 16; i++ {
+		if !<-done {
+			t.Error("concurrent request did not converge")
+		}
+	}
+}
+
 type stubListener struct{}
 
 func (stubListener) Accept() (net.Conn, error) { return nil, errors.New("not used") }

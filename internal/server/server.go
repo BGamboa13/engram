@@ -513,6 +513,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		Project       string `json:"project"`
 		Directory     string `json:"directory"`
 		OwnershipMode string `json:"ownership_mode"`
+		Resume        bool   `json:"resume"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
@@ -527,7 +528,14 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if mode == "" {
 		mode = store.SessionOwnershipShared
 	}
-	if err := s.store.StartSessionWithOwnershipMode(body.ID, body.Project, projectpkg.RuntimeWorktreeDirectory(body.Directory), mode); err != nil {
+	effectiveID := body.ID
+	var err error
+	if body.Resume {
+		effectiveID, err = s.store.ResumeSessionWithOwnershipMode(body.ID, body.Project, projectpkg.RuntimeWorktreeDirectory(body.Directory), mode)
+	} else {
+		err = s.store.StartSessionWithOwnershipMode(body.ID, body.Project, projectpkg.RuntimeWorktreeDirectory(body.Directory), mode)
+	}
+	if err != nil {
 		var conflict *store.SessionProjectConflictError
 		switch {
 		case errors.Is(err, store.ErrSessionAlreadyEnded):
@@ -551,7 +559,11 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.notifyWrite()
-	jsonResponse(w, http.StatusCreated, map[string]string{"id": body.ID, "status": "created"})
+	ack := map[string]string{"id": effectiveID, "status": "created"}
+	if effectiveID != body.ID {
+		ack["resumed_from"] = body.ID
+	}
+	jsonResponse(w, http.StatusCreated, ack)
 }
 
 func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {

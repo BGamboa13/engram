@@ -49,6 +49,8 @@ The same `engram.ts` supports OpenCode 1.x (1.18.29+) and 2.x. Its default expor
 
 > **Local model compatibility:** The plugin works with all models, including local ones served via llama.cpp, Ollama, or similar. The Memory Protocol is concatenated into the existing system prompt (not added as a separate system message), so models with strict Jinja templates (Qwen, Mistral/Ministral) work correctly.
 
+Both OpenCode majors register or renew with one `POST /sessions` using the root ID and `resume: true`. If the root has ended, the Go core atomically reuses a live `<root>:resume:N` continuation or creates the next numeric identity (starting at 2, without a restart cap); ended rows remain closed. The plugin caches only the acknowledged effective ID. Prompts, passive capture, attributed MCP writes, session lookups, compaction context, and disposal use it. Concurrent instances converge through the store transaction. Ownership conflicts and other failures refuse writes and warn once per root. Older servers that ignore `resume` refuse ended roots with `409 session_already_ended`; there is no client probing fallback. Failed or uncertain renewals retain cleanup ownership of previously acknowledged IDs; an unknown continuation created during an unacknowledged response may remain open rather than risk ending a guessed identity.
+
 ### What the Plugin Does
 
 The plugin:

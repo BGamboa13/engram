@@ -152,6 +152,16 @@ async function engramFetch(
   path: string,
   opts: { method?: string; body?: any } = {}
 ): Promise<any> {
+  const result = await engramFetchResult(path, opts)
+  return result?.ok ? result.body : null
+}
+
+// Registration needs the refusal code; other callers retain null-on-failure.
+async function engramFetchResult(
+  path: string,
+  opts: { method?: string; body?: any } = {},
+  readRefusal = false
+): Promise<{ ok: boolean; status: number; body: any } | null> {
 	if (!await ensureLocalReady()) return null
   try {
     const res = await fetch(`${ENGRAM_URL}${path}`, {
@@ -160,12 +170,10 @@ async function engramFetch(
       body: opts.body ? JSON.stringify(opts.body) : undefined,
       signal: AbortSignal.timeout(3000),
     })
-    if (!res.ok) return null
-    try {
-      return await res.json()
-    } catch {
-      return {}
-    }
+    if (!res.ok && !readRefusal) return { ok: false, status: res.status, body: null }
+    let body: any = {}
+    try { body = await res.json() } catch {}
+    return { ok: res.ok, status: res.status, body }
   } catch {
     // Engram server not running — silently fail
     return null
@@ -320,6 +328,20 @@ export const Engram: Plugin = async (ctx) => {
   const deletedRootSessions = new Set<string>()
   const registrationAttempts = new Set<string>()
   const registeringSessions = new Map<string, Promise<boolean>>()
+  // Ownership/lifecycle sets remain keyed by OpenCode root, never by a suffix.
+  const effectiveSessions = new Map<string, { id: string }>()
+  const cleanupSessions = new Map<string, Set<string>>()
+  const registrationErrors = new Map<string, string>()
+  const warnedSessions = new Set<string>()
+
+  function registrationFailed(sessionId: string, cause: string): false {
+    registrationErrors.set(sessionId, cause)
+    if (!warnedSessions.has(sessionId)) {
+      warnedSessions.add(sessionId)
+      console.warn(`gentle-engram session ${sessionId}: ${cause}; verify Engram project ownership and server availability, or start a new OpenCode session and retry`)
+    }
+    return false
+  }
   const closeRequestedSessions = new Set<string>()
   const closedSessions = new Set<string>()
   const closingSessions = new Map<string, Promise<boolean>>()
@@ -360,10 +382,13 @@ export const Engram: Plugin = async (ctx) => {
     const inFlight = closingSessions.get(sessionId)
     if (inFlight) return inFlight
 
-    const close = engramFetch(`/sessions/${encodeURIComponent(sessionId)}/end`, {
-      method: "POST",
-    }).then((acknowledgement) => {
+    const close = Promise.all([...(cleanupSessions.get(sessionId) ?? [])].map(async (effectiveID) => {
+      const acknowledgement = await engramFetch(`/sessions/${encodeURIComponent(effectiveID)}/end`, { method: "POST" })
       if (acknowledgement === null) return false
+      cleanupSessions.get(sessionId)?.delete(effectiveID)
+      return true
+    })).then((acknowledgements) => {
+      if (acknowledgements.some((acknowledged) => !acknowledged)) return false
       closedSessions.add(sessionId)
       for (const sessions of [knownSessions, registrationAttempts, deletedRootSessions, closeRequestedSessions])
         sessions.delete(sessionId)
@@ -520,13 +545,13 @@ export const Engram: Plugin = async (ctx) => {
   }
 
   /**
-   * Ensure a session exists in engram. Idempotent — calls POST /sessions
-   * which uses INSERT OR IGNORE. Safe to call multiple times.
+   * Register or renew the root through the core resume API, retaining only
+   * its acknowledged effective identity for session-bound writes.
    *
    * Silently skips sub-agent sessions (tracked in `subAgentSessions`).
    */
   async function ensureSession(sessionId: string, renew = false): Promise<boolean> {
-      if (disposed || !await ensureResolvedProject() || disposed) return false
+    if (disposed || !await ensureResolvedProject() || disposed) return false
     if (!sessionId || invalidSessions.has(sessionId) || closeRequestedSessions.has(sessionId) || closedSessions.has(sessionId)) return false
     if (!renew && knownSessions.has(sessionId)) return true
     // Do not register sub-agent sessions in Engram (issue #116).
@@ -534,14 +559,32 @@ export const Engram: Plugin = async (ctx) => {
     const inFlight = registeringSessions.get(sessionId)
     if (inFlight) return await inFlight && !closeRequestedSessions.has(sessionId)
     registrationAttempts.add(sessionId)
-    const registration = engramFetch("/sessions", {
-      method: "POST",
-      body: { id: sessionId, project, directory: ctx.directory },
-    }).then((acknowledgement) => {
-      if (acknowledgement?.id !== sessionId || acknowledgement?.status !== "created") return false
-      knownSessions.add(sessionId)
-      return true
-    }).finally(() => registeringSessions.delete(sessionId))
+    const registration = (async () => {
+      const cleanup = cleanupSessions.get(sessionId) ?? new Set<string>()
+      cleanupSessions.set(sessionId, cleanup)
+      knownSessions.delete(sessionId)
+      registrationErrors.delete(sessionId)
+      const result = await engramFetchResult("/sessions", {
+        method: "POST",
+        body: { id: sessionId, project, directory: ctx.directory, resume: true },
+      }, true)
+      const id = result?.body?.id
+      if (result?.ok && result.body?.status === "created" && typeof id === "string" &&
+          (id === sessionId || id.startsWith(`${sessionId}:resume:`))) {
+        effectiveSessions.set(sessionId, { id })
+        cleanup.add(id)
+        knownSessions.add(sessionId)
+        return true
+      }
+      // Failed or uncertain renewals retain previously acknowledged cleanup
+      // ownership. The server chooses new identities, so a newly created but
+      // unacknowledged continuation may remain open; never guess its identity.
+      const cause = result?.status === 409 &&
+          (result.body?.code === "session_project_conflict" || result.body?.code === "session_already_ended")
+        ? `HTTP 409 ${result.body.code}`
+        : result && !result.ok ? `HTTP ${result.status} session registration refused` : "session registration was not acknowledged"
+      return registrationFailed(sessionId, cause)
+    })().finally(() => registeringSessions.delete(sessionId))
     registeringSessions.set(sessionId, registration)
     return await registration && !invalidSessions.has(sessionId) && !closeRequestedSessions.has(sessionId)
   }
@@ -564,7 +607,7 @@ export const Engram: Plugin = async (ctx) => {
     await engramFetch("/prompts", {
       method: "POST",
       body: {
-        session_id: sessionId,
+        session_id: effectiveSessions.get(sessionId)!.id,
         // Redact before truncating: a <private> block straddling the
         // limit would otherwise lose its closing tag and leak.
         content: truncate(stripPrivateTags(content), 2000),
@@ -711,9 +754,9 @@ export const Engram: Plugin = async (ctx) => {
       }
       if (!registered) {
 			if (projectResolutionError) throw new Error(projectResolutionError)
-        throw new Error(`gentle-engram could not confirm Engram session registration for ${input.tool}; verify that the Engram server is available and retry`)
+        throw new Error(`gentle-engram could not confirm Engram session registration for ${input.tool}${registrationErrors.has(authoritativeSessionID) ? `: ${registrationErrors.get(authoritativeSessionID)}` : ""}; verify that the Engram server is available and retry`)
       }
-      output.args.session_id = authoritativeSessionID
+      output.args.session_id = effectiveSessions.get(authoritativeSessionID)!.id
     },
 
     "tool.execute.after": async (input, output) => {
@@ -734,7 +777,7 @@ export const Engram: Plugin = async (ctx) => {
           await engramFetch("/observations/passive", {
             method: "POST",
             body: {
-              session_id: sessionId,
+              session_id: effectiveSessions.get(sessionId)!.id,
               content: stripPrivateTags(text),
               project,
               source: "task-complete",
@@ -767,8 +810,11 @@ export const Engram: Plugin = async (ctx) => {
       // forget with short timeouts — any failure silently skips the nudge.
       try {
 			if (!await ensureResolvedProject()) return
-        const sessionID: string = input.sessionID ?? ""
-        if (!sessionID || invalidSessions.has(sessionID) || subAgentSessions.has(sessionID)) return
+        const rootID: string = input.sessionID ?? ""
+        if (!rootID || invalidSessions.has(rootID) || subAgentSessions.has(rootID)) return
+        // Read-only: never registers. A resumed root is looked up by the
+        // effective session its writes already use.
+        const sessionID = effectiveSessions.get(rootID)?.id ?? rootID
 
         const cooldownSecs = parseInt(process.env.ENGRAM_NUDGE_COOLDOWN_SECS ?? "900", 10)
         const nowSecs = Math.floor(Date.now() / 1000)
@@ -854,7 +900,7 @@ export const Engram: Plugin = async (ctx) => {
       // injection rather than falling back to project-wide manual context.
       if (sessionId && await ensureSession(sessionId, true)) {
         const data = await engramFetch(
-          `/context/compaction?session_id=${encodeURIComponent(sessionId)}`
+          `/context/compaction?session_id=${encodeURIComponent(effectiveSessions.get(sessionId)!.id)}`
         )
         if (data?.context) {
           output.context.push(data.context)
