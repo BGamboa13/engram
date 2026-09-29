@@ -408,7 +408,7 @@ func (mt *MutationTransport) AttestPromptSource(sessionID, sourceInboxID, syncID
 		// HTTP client errors may include server-controlled URLs or redirect text.
 		return 0, fmt.Errorf("cloud: %s request failed", operation)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return 0, &HTTPStatusError{Operation: operation, StatusCode: resp.StatusCode, Body: http.StatusText(resp.StatusCode)}
 	}
