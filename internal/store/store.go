@@ -1275,6 +1275,20 @@ func (s *Store) migrate() error {
 				deleted_at TEXT NOT NULL DEFAULT (datetime('now'))
 			);
 
+			-- Local-only human/server confirmation; never part of sync or backup payloads.
+			CREATE TABLE IF NOT EXISTS prompt_source_confirmations (
+				remote_target TEXT NOT NULL CHECK(length(trim(remote_target)) > 0),
+				sync_id TEXT NOT NULL,
+				session_id TEXT NOT NULL,
+				source_inbox_id TEXT NOT NULL,
+				prompt_project TEXT NOT NULL,
+				kind TEXT NOT NULL CHECK(kind IN ('live','deleted')),
+				asserted_owner_project TEXT NOT NULL,
+				remote_attestation_id INTEGER NOT NULL CHECK(remote_attestation_id > 0),
+				confirmed_at TEXT NOT NULL DEFAULT (datetime('now')),
+				PRIMARY KEY (remote_target, sync_id)
+			);
+
 			CREATE TABLE IF NOT EXISTS sync_delete_tombstones (
 				entity      TEXT NOT NULL,
 				entity_key  TEXT NOT NULL,
