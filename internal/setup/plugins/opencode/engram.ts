@@ -669,7 +669,9 @@ export const Engram: Plugin = async (ctx) => {
           method: "POST",
           body: {
             session_id: sessionId,
-            content: stripPrivateTags(truncate(finalContent, 2000)),
+            // Redact before truncating: a <private> block straddling the
+            // limit would otherwise lose its closing tag and leak.
+            content: truncate(stripPrivateTags(finalContent), 2000),
             project,
           },
         })

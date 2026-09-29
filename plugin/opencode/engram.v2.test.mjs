@@ -276,6 +276,21 @@ test("V2 prompt hook captures user prompts for the authoritative session", async
   ])
 })
 
+test("V2 prompt hook redacts a private block that straddles the truncation limit", async (t) => {
+  const runtime = await setupV2(t, { sessions: new Map([["ses_root", sessionInfo("ses_root")]]) })
+  await runtime.hooks.get("session.prompt")({
+    sessionID: "ses_root",
+    messageID: "msg_1",
+    prompt: { text: `${"a".repeat(1980)}<private>PIN=42</private> trailing` },
+    delivery: "immediate",
+  })
+
+  const prompts = runtime.posts("/prompts").map(({ body }) => body)
+  assert.equal(prompts.length, 1)
+  assert.equal(JSON.stringify(prompts[0]).includes("PIN=42"), false)
+  assert.equal(prompts[0].content.includes("[REDACTED]"), true)
+})
+
 test("V2 tool hooks bind Engram writes to the root session and capture subagent output", async (t) => {
   const runtime = await setupV2(t, {
     sessions: new Map([["ses_root", sessionInfo("ses_root")], ["ses_child", sessionInfo("ses_child", "ses_root")]]),

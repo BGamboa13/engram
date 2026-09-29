@@ -937,6 +937,17 @@ test("write tool hook revalidates leaf and ancestor ownership after registration
   }
 })
 
+test("chat.message redacts a private block that straddles the truncation limit", async (t) => {
+  const runtime = await createRuntime(t)
+  const text = `${"a".repeat(1980)}<private>PIN=42</private> trailing`
+  await runtime.chat({ sessionID: "runtime" }, { message: {}, parts: [{ type: "text", text }] })
+
+  const prompts = runtime.requests.filter(({ path }) => path === "/prompts")
+  assert.equal(prompts.length, 1)
+  assert.equal(JSON.stringify(prompts[0].body).includes("PIN=42"), false)
+  assert.equal(prompts[0].body.content.includes("[REDACTED]"), true)
+})
+
 test("chat.message resolves an unobserved child and skips its prompt", async (t) => {
   const runtime = await createRuntime(t, { sessionGet: sdkLookup(CHILD_SESSIONS) })
   await runtime.chat(
