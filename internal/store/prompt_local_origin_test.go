@@ -104,7 +104,167 @@ func TestLocalPromptCreationIdentity(t *testing.T) {
 	if err := s.DeletePrompt(deleteID); err != nil {
 		t.Fatal(err)
 	}
-	check(deleteSyncID, "", "", "", false)
+	check(deleteSyncID, "session", "delete-inbox", "beta", true)
+	var origin string
+	if err := s.DB().QueryRow(`SELECT local_creation_project FROM prompt_tombstones WHERE sync_id=?`, deleteSyncID).Scan(&origin); err != nil || origin != "beta" {
+		t.Fatalf("local tombstone origin: %q %v", origin, err)
+	}
+}
+
+func TestLocalPromptOriginSessionDeleteAndUntrustedTombstones(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("alpha-session", "alpha", "/work"); err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := s.AddPromptWithResult(AddPromptParams{SessionID: "alpha-session", Project: "beta", SourceInboxID: "beta-inbox", Content: "local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var syncID string
+	if err := s.DB().QueryRow(`SELECT sync_id FROM user_prompts WHERE id=?`, id).Scan(&syncID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSession("alpha-session"); err != nil {
+		t.Fatal(err)
+	}
+	if session, inbox, project, ok, err := s.LocalPromptCreationIdentity(syncID); err != nil || !ok || session != "alpha-session" || inbox != "beta-inbox" || project != "beta" {
+		t.Fatalf("session delete: %q %q %q %v %v", session, inbox, project, ok, err)
+	}
+	checkUnknown := func(key string) {
+		t.Helper()
+		if a, b, c, ok, err := s.LocalPromptCreationIdentity(key); err != nil || ok || a != "" || b != "" || c != "" {
+			t.Fatalf("untrusted %s: %q %q %q %v %v", key, a, b, c, ok, err)
+		}
+	}
+	if _, err := s.DB().Exec(`INSERT INTO prompt_tombstones(sync_id,session_id,source_inbox_id,project) VALUES ('imported','alpha-session','import-key','beta')`); err != nil {
+		t.Fatal(err)
+	}
+	checkUnknown("imported")
+	backup, err := s.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	imported := newTestStore(t)
+	if _, err := imported.Import(backup); err != nil {
+		t.Fatal(err)
+	}
+	if a, b, c, ok, err := imported.LocalPromptCreationIdentity(syncID); err != nil || ok || a != "" || b != "" || c != "" {
+		t.Fatalf("imported tombstone promoted: %q %q %q %v %v", a, b, c, ok, err)
+	}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 11, Entity: SyncEntityPrompt, EntityKey: "pulled", Op: SyncOpDelete, Payload: `{"sync_id":"pulled","session_id":"alpha-session","source_inbox_id":"pull-key","project":"beta","deleted":true,"hard_delete":true}`, Source: SyncSourceRemote, Project: "beta"}); err != nil {
+		t.Fatal(err)
+	}
+	checkUnknown("pulled")
+	if _, err := s.DB().Exec(`UPDATE prompt_tombstones SET project='gamma' WHERE sync_id=?`, syncID); err != nil {
+		t.Fatal(err)
+	}
+	checkUnknown(syncID)
+	if _, err := s.DB().Exec(`UPDATE prompt_tombstones SET project='beta' WHERE sync_id=?`, syncID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateSession("other", "alpha", "/work"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO user_prompts(sync_id,session_id,source_inbox_id,project,content) VALUES (?,'other','duplicate','beta','duplicate')`, syncID); err != nil {
+		t.Fatal(err)
+	}
+	checkUnknown(syncID)
+}
+
+func TestLocalPromptOriginDeleteBoundaries(t *testing.T) {
+	checkUnknown := func(t *testing.T, s *Store, key string) {
+		t.Helper()
+		a, b, c, ok, err := s.LocalPromptCreationIdentity(key)
+		if err != nil || ok || a != "" || b != "" || c != "" {
+			t.Fatalf("unexpected origin: %q %q %q %v %v", a, b, c, ok, err)
+		}
+	}
+	newLocal := func(t *testing.T, s *Store, inbox string) (int64, string) {
+		t.Helper()
+		id, _, err := s.AddPromptWithResult(AddPromptParams{SessionID: "alpha-session", Project: "beta", SourceInboxID: inbox, Content: "local"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var key string
+		if err := s.DB().QueryRow(`SELECT sync_id FROM user_prompts WHERE id=?`, id).Scan(&key); err != nil {
+			t.Fatal(err)
+		}
+		return id, key
+	}
+	for _, tc := range []struct {
+		name string
+		run  func(*testing.T, *Store)
+	}{
+		{"existing remote tombstone", func(t *testing.T, s *Store) {
+			id, key := newLocal(t, s, "remote-inbox")
+			if _, err := s.DB().Exec(`INSERT INTO prompt_tombstones(sync_id,session_id,source_inbox_id,project) VALUES (?,'alpha-session','remote-inbox','beta')`, key); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.DeletePrompt(id); err != nil {
+				t.Fatal(err)
+			}
+			checkUnknown(t, s, key)
+		}},
+		{"pulled delete of live local prompt", func(t *testing.T, s *Store) {
+			_, key := newLocal(t, s, "pulled-inbox")
+			err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 21, Entity: SyncEntityPrompt, EntityKey: key, Op: SyncOpDelete, Payload: `{"sync_id":"` + key + `","session_id":"alpha-session","source_inbox_id":"pulled-inbox","project":"beta","deleted":true,"hard_delete":true}`, Source: SyncSourceRemote, Project: "beta"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkUnknown(t, s, key)
+		}},
+		{"duplicate sync ID at deletion", func(t *testing.T, s *Store) {
+			id, key := newLocal(t, s, "first-inbox")
+			if _, err := s.DB().Exec(`INSERT INTO user_prompts(sync_id,session_id,source_inbox_id,project,content) VALUES (?,'alpha-session','second-inbox','beta','duplicate')`, key); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.DeletePrompt(id); err != nil {
+				t.Fatal(err)
+			}
+			checkUnknown(t, s, key)
+		}},
+		{"replay retains origin and conflict fails closed", func(t *testing.T, s *Store) {
+			id, key := newLocal(t, s, "replay-inbox")
+			if err := s.DeletePrompt(id); err != nil {
+				t.Fatal(err)
+			}
+			tx, err := s.DB().Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			project := "beta"
+			if err := s.recordPromptTombstoneTx(tx, key, "alpha-session", &project, "replay-inbox", Now()); err != nil {
+				_ = tx.Rollback()
+				t.Fatal(err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			a, b, c, ok, err := s.LocalPromptCreationIdentity(key)
+			if err != nil || !ok || a != "alpha-session" || b != "replay-inbox" || c != "beta" {
+				t.Fatalf("replay origin: %q %q %q %v %v", a, b, c, ok, err)
+			}
+			tx, err = s.DB().Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.recordPromptTombstoneTx(tx, key, "alpha-session", &project, "conflicting-inbox", Now()); err == nil {
+				_ = tx.Rollback()
+				t.Fatal("conflicting replay accepted")
+			}
+			if err := tx.Rollback(); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			if err := s.CreateSession("alpha-session", "alpha", "/work"); err != nil {
+				t.Fatal(err)
+			}
+			tc.run(t, s)
+		})
+	}
 }
 
 func TestLocalPromptCreationIdentityDuplicateSyncID(t *testing.T) {
@@ -141,6 +301,12 @@ func TestLocalPromptCreationIdentityMigration(t *testing.T) {
 	if _, err = s.DB().Exec(`INSERT INTO user_prompts(sync_id,session_id,source_inbox_id,project,content) VALUES ('old-prompt','old','key','beta','old')`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = s.DB().Exec(`INSERT INTO prompt_tombstones(sync_id,session_id,source_inbox_id,project) VALUES ('old-deleted','old','key','beta')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.DB().Exec(`ALTER TABLE prompt_tombstones DROP COLUMN local_creation_session_id`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = s.DB().Exec(`ALTER TABLE user_prompts DROP COLUMN local_creation_session_id`); err != nil {
 		t.Fatal(err)
 	}
@@ -159,8 +325,10 @@ func TestLocalPromptCreationIdentityMigration(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	session, inbox, project, eligible, err := s.LocalPromptCreationIdentity("old-prompt")
-	if err != nil || session != "" || inbox != "" || project != "" || eligible {
-		t.Fatalf("migration: %q %q %q %v %v", session, inbox, project, eligible, err)
+	for _, key := range []string{"old-prompt", "old-deleted"} {
+		session, inbox, project, eligible, err := s.LocalPromptCreationIdentity(key)
+		if err != nil || session != "" || inbox != "" || project != "" || eligible {
+			t.Fatalf("migration %s: %q %q %q %v %v", key, session, inbox, project, eligible, err)
+		}
 	}
 }

@@ -1267,6 +1267,9 @@ func (s *Store) migrate() error {
 			CREATE TABLE IF NOT EXISTS prompt_tombstones (
 				sync_id    TEXT PRIMARY KEY,
                 source_inbox_id TEXT,
+                local_creation_session_id TEXT,
+                local_creation_inbox_id TEXT,
+                local_creation_project TEXT,
 				session_id TEXT,
 				project    TEXT,
 				deleted_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -1420,6 +1423,11 @@ func (s *Store) migrate() error {
 	}
 	if err := s.addColumnIfNotExists("prompt_tombstones", "source_inbox_id", "TEXT"); err != nil {
 		return err
+	}
+	for _, column := range []string{"local_creation_session_id", "local_creation_inbox_id", "local_creation_project"} {
+		if err := s.addColumnIfNotExists("prompt_tombstones", column, "TEXT"); err != nil {
+			return err
+		}
 	}
 	if err := s.addColumnIfNotExists("sync_delete_tombstones", "last_remote_mutation_seq", "INTEGER"); err != nil {
 		return err
@@ -3912,8 +3920,8 @@ func (s *Store) AddPromptWithResult(p AddPromptParams) (int64, bool, error) {
 	return promptID, inserted, nil
 }
 
-// LocalPromptCreationIdentity returns a live locally inserted keyed identity by sync ID.
-// Unknown, ambiguous and mismatched identities fail closed; deleted rows have no fallback.
+// LocalPromptCreationIdentity returns verified local creation identity by exact sync ID.
+// A tombstone is eligible only when its separately recorded local origin matches.
 func (s *Store) LocalPromptCreationIdentity(syncID string) (session, inbox, project string, eligible bool, err error) {
 	if syncID == "" {
 		return "", "", "", false, nil
@@ -3925,7 +3933,24 @@ func (s *Store) LocalPromptCreationIdentity(syncID string) (session, inbox, proj
 	}
 	defer func() { _ = rows.Close() }()
 	if !rows.Next() {
-		return "", "", "", false, rows.Err()
+		if err := rows.Err(); err != nil {
+			return "", "", "", false, err
+		}
+		var originalSession, originalInbox, originalProject sql.NullString
+		err := s.db.QueryRow(`SELECT local_creation_session_id, local_creation_inbox_id, local_creation_project,
+			ifnull(session_id,''), ifnull(source_inbox_id,''), ifnull(project,'') FROM prompt_tombstones WHERE sync_id=?`, syncID).
+			Scan(&originalSession, &originalInbox, &originalProject, &session, &inbox, &project)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", "", false, nil
+		}
+		if err != nil {
+			return "", "", "", false, err
+		}
+		if originalSession.String == "" || originalInbox.String == "" || originalProject.String == "" ||
+			originalSession.String != session || originalInbox.String != inbox || originalProject.String != project {
+			return "", "", "", false, nil
+		}
+		return session, inbox, project, true, nil
 	}
 	var originalSession, originalInbox, originalProject sql.NullString
 	if err := rows.Scan(&originalSession, &originalInbox, &originalProject, &session, &inbox, &project); err != nil {
@@ -4182,20 +4207,23 @@ func (s *Store) DeleteSession(id string) error {
 		}
 
 		deletedAt := Now()
-		promptRows, err := s.queryItHook(tx, `SELECT sync_id, session_id, ifnull(project, ''), ifnull(source_inbox_id, '') FROM user_prompts WHERE session_id = ? ORDER BY id ASC`, id)
+		promptRows, err := s.queryItHook(tx, `SELECT id, sync_id, session_id, ifnull(project, ''), ifnull(source_inbox_id, '') FROM user_prompts WHERE session_id = ? ORDER BY id ASC`, id)
 		if err != nil {
 			return fmt.Errorf("delete session: load prompts: %w", err)
 		}
 		var prompts []syncPromptPayload
+		var promptIDs []int64
 		for promptRows.Next() {
 			var prompt syncPromptPayload
-			if err := promptRows.Scan(&prompt.SyncID, &prompt.SessionID, &prompt.Project, &prompt.SourceInboxID); err != nil {
+			var promptID int64
+			if err := promptRows.Scan(&promptID, &prompt.SyncID, &prompt.SessionID, &prompt.Project, &prompt.SourceInboxID); err != nil {
 				return closeRowsWithError(promptRows, fmt.Errorf("delete session: load prompts: %w", err))
 			}
 			if strings.TrimSpace(derefString(prompt.Project)) == "" {
 				prompt.Project = nullableString(project)
 			}
 			prompts = append(prompts, prompt)
+			promptIDs = append(promptIDs, promptID)
 		}
 		if err := promptRows.Close(); err != nil {
 			return err
@@ -4203,8 +4231,8 @@ func (s *Store) DeleteSession(id string) error {
 		if err := promptRows.Err(); err != nil {
 			return err
 		}
-		for _, prompt := range prompts {
-			if err := s.recordPromptTombstoneTx(tx, prompt.SyncID, prompt.SessionID, prompt.Project, prompt.SourceInboxID, deletedAt); err != nil {
+		for i, prompt := range prompts {
+			if err := s.recordLocalPromptTombstoneTx(tx, promptIDs[i], prompt.SyncID, prompt.SessionID, prompt.Project, prompt.SourceInboxID, deletedAt); err != nil {
 				return fmt.Errorf("delete session: record prompt tombstone: %w", err)
 			}
 		}
@@ -4296,6 +4324,9 @@ func (s *Store) DeletePrompt(id int64) error {
 		payload.HardDelete = true
 		payload.DeletedAt = &now
 
+		if err := s.recordLocalPromptTombstoneTx(tx, id, payload.SyncID, payload.SessionID, payload.Project, payload.SourceInboxID, now); err != nil {
+			return fmt.Errorf("delete prompt: record tombstone: %w", err)
+		}
 		res, err := s.execHook(tx, `DELETE FROM user_prompts WHERE id = ?`, id)
 		if err != nil {
 			return fmt.Errorf("delete prompt: %w", err)
@@ -4306,9 +4337,6 @@ func (s *Store) DeletePrompt(id int64) error {
 		}
 		if n == 0 {
 			return fmt.Errorf("%w: prompt #%d", ErrPromptNotFound, id)
-		}
-		if err := s.recordPromptTombstoneTx(tx, payload.SyncID, payload.SessionID, payload.Project, payload.SourceInboxID, now); err != nil {
-			return fmt.Errorf("delete prompt: upsert tombstone: %w", err)
 		}
 		enrolled, err := isProjectEnrolledTx(tx, project)
 		if err != nil {
@@ -9328,6 +9356,36 @@ func promptInboxDeletedTx(tx *sql.Tx, sessionID, inboxID string) (bool, error) {
 	var exists bool
 	err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM prompt_tombstones WHERE session_id = ? AND source_inbox_id = ?)`, sessionID, inboxID).Scan(&exists)
 	return exists, err
+}
+
+// recordLocalPromptTombstoneTx preserves only a verified original live marker.
+// Existing tombstones are never promoted, even when their ordinary identity matches.
+func (s *Store) recordLocalPromptTombstoneTx(tx *sql.Tx, id int64, syncID, sessionID string, project *string, inboxID, deletedAt string) error {
+	var existing, count int
+	if syncID != "" {
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM prompt_tombstones WHERE sync_id=?)`, syncID).Scan(&existing); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM user_prompts WHERE sync_id=?`, syncID).Scan(&count); err != nil {
+			return err
+		}
+	}
+	var originalSession, originalInbox, originalProject sql.NullString
+	if err := tx.QueryRow(`SELECT local_creation_session_id, local_creation_inbox_id, local_creation_project FROM user_prompts WHERE id=?`, id).
+		Scan(&originalSession, &originalInbox, &originalProject); err != nil {
+		return err
+	}
+	if err := s.recordPromptTombstoneTx(tx, syncID, sessionID, project, inboxID, deletedAt); err != nil {
+		return err
+	}
+	if existing != 0 || count != 1 || originalSession.String == "" || originalInbox.String == "" || originalProject.String == "" ||
+		originalSession.String != sessionID || originalInbox.String != inboxID || originalProject.String != derefString(project) {
+		return nil
+	}
+	_, err := s.execHook(tx, `UPDATE prompt_tombstones SET local_creation_session_id=?, local_creation_inbox_id=?, local_creation_project=?
+		WHERE sync_id=? AND local_creation_session_id IS NULL AND local_creation_inbox_id IS NULL AND local_creation_project IS NULL`,
+		originalSession.String, originalInbox.String, originalProject.String, syncID)
+	return err
 }
 
 func (s *Store) recordPromptTombstoneTx(tx *sql.Tx, syncID, sessionID string, project *string, inboxID, deletedAt string) error {
