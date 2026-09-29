@@ -349,6 +349,33 @@ func (s *autosyncFakeStore) ListPendingSyncMutations(_ string, limit int) ([]sto
 	return result, nil
 }
 
+func (s *autosyncFakeStore) MaxPendingSyncMutationSeq(string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var max int64
+	for _, mutation := range s.mutations {
+		max = mutation.seq
+	}
+	return max, nil
+}
+
+func (s *autosyncFakeStore) ListPendingSyncMutationsAfterSeq(target string, after int64, limit int) ([]store.SyncMutation, error) {
+	pending, err := s.ListPendingSyncMutations(target, len(s.mutations))
+	if err != nil {
+		return nil, err
+	}
+	var page []store.SyncMutation
+	for _, mutation := range pending {
+		if mutation.Seq > after {
+			page = append(page, mutation)
+			if len(page) == limit {
+				break
+			}
+		}
+	}
+	return page, nil
+}
+
 func (s *autosyncFakeStore) CountPendingNonEnrolledSyncMutations(_ string) ([]store.PendingSyncMutationProjectCount, error) {
 	return nil, nil
 }

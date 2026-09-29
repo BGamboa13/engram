@@ -19,29 +19,30 @@ import (
 // ─── Fakes ───────────────────────────────────────────────────────────────────
 
 type fakeLocalStore struct {
-	mu                sync.Mutex
-	mutations         []store.SyncMutation
-	syncState         *store.SyncState
-	leaseOwner        string
-	leaseCalls        int
-	pushErr           error
-	pullErr           error
-	failureMessage    string
-	failureReason     string
-	blockedReason     string
-	blockedMessage    string
-	appliedMuts       []store.SyncMutation
-	acquireGranted    bool
-	ackedSeqs         []int64
-	ackErr            error
-	healthyCalls              int
+	mu                       sync.Mutex
+	mutations                []store.SyncMutation
+	syncState                *store.SyncState
+	leaseOwner               string
+	leaseCalls               int
+	pushErr                  error
+	pullErr                  error
+	failureMessage           string
+	failureReason            string
+	blockedReason            string
+	blockedMessage           string
+	appliedMuts              []store.SyncMutation
+	acquireGranted           bool
+	ackedSeqs                []int64
+	ackErr                   error
+	healthyCalls             int
+	staleHighWater           bool
 	blockedAfterSuccessCalls int
 	blockedAfterSuccessErr   error
 	nonEnrolledCounts        []store.PendingSyncMutationProjectCount
-	deferredProjects  []string
-	listDeferredErr   error
-	listedTargets     []string
-	replayedScopes    []string
+	deferredProjects         []string
+	listDeferredErr          error
+	listedTargets            []string
+	replayedScopes           []string
 }
 
 func newFakeLocalStore() *fakeLocalStore {
@@ -61,7 +62,16 @@ func (s *fakeLocalStore) GetSyncState(_ string) (*store.SyncState, error) {
 	if s.pullErr != nil {
 		return nil, s.pullErr
 	}
-	return s.syncState, nil
+	state := *s.syncState
+	if s.staleHighWater {
+		return &state, nil
+	}
+	for _, mutation := range s.mutations {
+		if mutation.Seq > state.LastEnqueuedSeq {
+			state.LastEnqueuedSeq = mutation.Seq
+		}
+	}
+	return &state, nil
 }
 
 func (s *fakeLocalStore) ListPendingSyncMutations(_ string, limit int) ([]store.SyncMutation, error) {
@@ -78,6 +88,34 @@ func (s *fakeLocalStore) ListPendingSyncMutations(_ string, limit int) ([]store.
 		n = limit
 	}
 	return s.mutations[:n], nil
+}
+
+func (s *fakeLocalStore) MaxPendingSyncMutationSeq(string) (int64, error) {
+	var max int64
+	for _, mutation := range s.mutations {
+		if mutation.Seq > max {
+			max = mutation.Seq
+		}
+	}
+	return max, nil
+}
+
+func (s *fakeLocalStore) ListPendingSyncMutationsAfterSeq(_ string, afterSeq int64, limit int) ([]store.SyncMutation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pushErr != nil {
+		return nil, s.pushErr
+	}
+	var page []store.SyncMutation
+	for _, mutation := range s.mutations {
+		if mutation.Seq > afterSeq {
+			page = append(page, mutation)
+			if len(page) == limit {
+				break
+			}
+		}
+	}
+	return page, nil
 }
 
 func (s *fakeLocalStore) CountPendingNonEnrolledSyncMutations(_ string) ([]store.PendingSyncMutationProjectCount, error) {
@@ -326,6 +364,131 @@ func attemptedProjects(t *fakeCloudTransport) []string {
 		}
 	}
 	return projects
+}
+
+type provenanceLocalStore struct {
+	*fakeLocalStore
+	owner, session, inbox, project string
+	eligible                       bool
+}
+
+func (s *provenanceLocalStore) LocalSessionProvenance(string) (string, bool, error) {
+	return s.owner, s.eligible, nil
+}
+func (s *provenanceLocalStore) LocalPromptCreationIdentity(string) (string, string, string, bool, error) {
+	return s.session, s.inbox, s.project, s.eligible, nil
+}
+
+type provenanceTransport struct {
+	*fakeCloudTransport
+	calls                 []string
+	registerErr, claimErr error
+}
+
+func (t *provenanceTransport) RegisterSessionAuthority(session, owner string) error {
+	t.calls = append(t.calls, "register:"+session+":"+owner)
+	return t.registerErr
+}
+func (t *provenanceTransport) ClaimPromptPair(session, inbox, syncID, owner, project string) error {
+	t.calls = append(t.calls, "claim:"+session+":"+inbox+":"+syncID+":"+owner+":"+project)
+	return t.claimErr
+}
+
+func TestManagerKeyedPromptPreflight(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		eligible              bool
+		registerErr, claimErr error
+		wantCalls             string
+	}{
+		{"success", true, nil, nil, "[register:s:alpha claim:s:i:p:alpha:beta]"},
+		{"missing origin", false, nil, nil, "[]"},
+		{"registration fails", true, errors.New("register denied"), nil, "[register:s:alpha]"},
+		{"claim fails", true, nil, errors.New("claim denied"), "[register:s:alpha claim:s:i:p:alpha:beta]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ls := &provenanceLocalStore{fakeLocalStore: newFakeLocalStore(), owner: "alpha", session: "s", inbox: "i", project: "beta", eligible: tc.eligible}
+			ls.mutations = []store.SyncMutation{
+				{Seq: 1, Entity: "prompt", EntityKey: "p", Op: "delete", Project: "beta", Payload: `{"sync_id":"p","session_id":"s","source_inbox_id":"i","project":"beta"}`},
+				{Seq: 2, Entity: "obs", EntityKey: "healthy", Op: "upsert", Project: "beta"},
+			}
+			tr := &provenanceTransport{fakeCloudTransport: newFakeTransport(), registerErr: tc.registerErr, claimErr: tc.claimErr}
+			tr.pushResult = &PushMutationsResult{AcceptedSeqs: []int64{2}}
+			if tc.name == "success" {
+				tr.pushResult = &PushMutationsResult{AcceptedSeqs: []int64{1, 2}}
+			}
+			err := New(ls, tr, DefaultConfig()).push(context.Background())
+			if (err == nil) != (tc.name == "success") {
+				t.Fatalf("push error: %v", err)
+			}
+			if got := fmt.Sprint(tr.calls); got != tc.wantCalls {
+				t.Fatalf("preflight calls %s, want %s", got, tc.wantCalls)
+			}
+			if tc.name != "success" && (len(tr.attempted) != 1 || len(tr.attempted[0]) != 1 || tr.attempted[0][0].EntityKey != "healthy" || fmt.Sprint(ls.ackedSeqs) != "[2]") {
+				t.Fatalf("unsafe push or ack: attempts=%v ack=%v", tr.attempted, ls.ackedSeqs)
+			}
+		})
+	}
+}
+
+func TestManagerPromptPreflightNoImplicitAuthority(t *testing.T) {
+	for _, tc := range []struct {
+		name, payload string
+		eligible      bool
+		wantPush      bool
+	}{
+		{"idless", `{"sync_id":"p","session_id":"s","project":"beta"}`, false, true},
+		{"imported keyed", `{"sync_id":"p","session_id":"s","source_inbox_id":"i","project":"beta"}`, false, false},
+		{"mismatched project", `{"sync_id":"p","session_id":"s","source_inbox_id":"i","project":"alpha"}`, true, false},
+		{"deleted session", `{"sync_id":"p","session_id":"s","source_inbox_id":"i","project":"beta"}`, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ls := &provenanceLocalStore{fakeLocalStore: newFakeLocalStore(), owner: "alpha", session: "s", inbox: "i", project: "beta", eligible: tc.eligible}
+			ls.mutations = []store.SyncMutation{{Seq: 1, Entity: "prompt", EntityKey: "p", Project: "beta", Op: "delete", Payload: tc.payload}}
+			tr := &provenanceTransport{fakeCloudTransport: newFakeTransport()}
+			tr.pushResult = &PushMutationsResult{AcceptedSeqs: []int64{1}}
+			err := New(ls, tr, DefaultConfig()).push(context.Background())
+			if (err == nil) != tc.wantPush || (len(tr.attempted) == 1) != tc.wantPush || (len(ls.ackedSeqs) == 1) != tc.wantPush {
+				t.Fatalf("error=%v attempts=%v ack=%v", err, tr.attempted, ls.ackedSeqs)
+			}
+			if len(tr.calls) != 0 {
+				t.Fatalf("unexpected authority calls: %v", tr.calls)
+			}
+		})
+	}
+}
+
+func TestManagerStaleEnqueuedStateDoesNotHidePending(t *testing.T) {
+	ls := newFakeLocalStore()
+	ls.staleHighWater = true
+	ls.mutations = []store.SyncMutation{{Seq: 5, Entity: "obs", EntityKey: "later", Op: "upsert", Project: "alpha"}}
+	tr := newFakeTransport()
+	tr.pushResult = &PushMutationsResult{AcceptedSeqs: []int64{5}}
+	if err := New(ls, tr, DefaultConfig()).push(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(ls.ackedSeqs) != "[5]" {
+		t.Fatalf("pending mutation hidden by stale state: ack=%v", ls.ackedSeqs)
+	}
+}
+
+func TestManagerBlockedFirstPageDoesNotStarveLaterEntries(t *testing.T) {
+	ls := &provenanceLocalStore{fakeLocalStore: newFakeLocalStore()}
+	ls.mutations = []store.SyncMutation{
+		{Seq: 1, Entity: "prompt", EntityKey: "unverified", Op: "delete", Project: "beta", Payload: `{"sync_id":"unverified","session_id":"s","source_inbox_id":"i","project":"beta"}`},
+		{Seq: 2, Entity: "obs", EntityKey: "healthy", Op: "upsert", Project: "beta"},
+		{Seq: 3, Entity: "obs", EntityKey: "later", Op: "upsert", Project: "alpha"},
+	}
+	tr := &provenanceTransport{fakeCloudTransport: newFakeTransport()}
+	tr.pushResultByProject = map[string]*PushMutationsResult{"beta": {AcceptedSeqs: []int64{2}}, "alpha": {AcceptedSeqs: []int64{3}}}
+	cfg := DefaultConfig()
+	cfg.PushBatchSize = 1
+	if err := New(ls, tr, cfg).push(context.Background()); err == nil || !strings.Contains(err.Error(), "unverified") {
+		t.Fatalf("expected visible blocked origin, got %v", err)
+	}
+	if fmt.Sprint(ls.ackedSeqs) != "[2 3]" || fmt.Sprint(attemptedProjects(tr.fakeCloudTransport)) != "[beta alpha]" {
+		t.Fatalf("starved healthy entries: ack=%v attempts=%v", ls.ackedSeqs, attemptedProjects(tr.fakeCloudTransport))
+	}
 }
 
 // ─── Push ack safety regressions ─────────────────────────────────────────────
