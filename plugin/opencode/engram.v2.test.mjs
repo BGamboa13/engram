@@ -14,8 +14,8 @@ const PROJECT_ID = "project-1"
 const INSTANCE_ID = "00000000000000000000000000000000"
 let runtimeImport = 0
 
-function httpResponse(data) {
-  return { ok: true, async json() { return data } }
+function httpResponse(data, status = 200) {
+  return { ok: status >= 200 && status < 300, status, async json() { return data } }
 }
 
 // Minimal OpenCode V2 event stream. emit() resolves once the plugin asks for
@@ -107,7 +107,7 @@ async function waitFor(condition, message, ms = 1000) {
   }
 }
 
-async function setupV2(t, { sessions = new Map() } = {}) {
+async function setupV2(t, { sessions = new Map(), promptResponse } = {}) {
   const originalFetch = globalThis.fetch
   const originalBun = globalThis.Bun
   const originalEngramURL = process.env.ENGRAM_URL
@@ -130,6 +130,7 @@ async function setupV2(t, { sessions = new Map() } = {}) {
     if (path === "/project/current") return httpResponse({ project: "engram", project_source: "git_remote" })
     if (path === "/sessions") return httpResponse({ id: body.id, status: "created" })
     if (path === "/context/compaction") return httpResponse({ context: "previous session context" })
+    if (path === "/prompts" && promptResponse) return promptResponse(body)
     return httpResponse({})
   }
 
@@ -183,6 +184,11 @@ async function setupV2(t, { sessions = new Map() } = {}) {
       data: { sessionID, projectID: PROJECT_ID, location: { directory: DIRECTORY }, ...(parentID ? { parentID } : {}) },
     }),
     deleted: (sessionID) => events.emit({ type: "session.deleted", data: { sessionID } }),
+    enqueued: (sessionID, inboxID, item, location) => events.emit({
+      type: "session.inbox.enqueued",
+      ...(location ? { location } : {}),
+      data: { sessionID, inboxID, item },
+    }),
     posts: (path) => requests.filter((request) => request.method === "POST" && request.path === path),
   }
 }
@@ -204,7 +210,6 @@ test("V2 setup registers session, tool, and event hooks and cleans them up", asy
   assert.deepEqual([...runtime.hooks.keys()].sort(), [
     "session.compaction",
     "session.context",
-    "session.prompt",
     "tool.execute.after",
     "tool.execute.before",
   ])
@@ -214,7 +219,7 @@ test("V2 setup registers session, tool, and event hooks and cleans them up", asy
   await runtime.created("ses_root")
   await runtime.cleanup()
 
-  assert.equal(runtime.disposedHooks.length, 5)
+  assert.equal(runtime.disposedHooks.length, 4)
   assert.equal(runtime.events.subscriptions[0].signal.aborted, true)
   assert.equal(runtime.posts("/sessions/ses_root/end").length, 1, "cleanup ends registered sessions")
 })
@@ -259,31 +264,90 @@ test("V2 setup releases earlier registrations when a later one fails", async (t)
   }
   const disposed = []
   await assert.rejects(runtime.module.default.setup(ctx), /tool hooks unavailable/)
-  assert.deepEqual(disposed, ["prompt", "context", "compaction"])
+  assert.deepEqual(disposed, ["context", "compaction"])
 })
 
-test("V2 prompt hook captures user prompts for the authoritative session", async (t) => {
+function userItem(text, delivery = "queue") {
+  return { type: "user", payload: { text }, delivery }
+}
+
+test("V2 captures user inbox items with their durable inbox identity", async (t) => {
   const runtime = await setupV2(t, { sessions: new Map([["ses_root", sessionInfo("ses_root")]]) })
-  await runtime.hooks.get("session.prompt")({
-    sessionID: "ses_root",
-    messageID: "msg_1",
-    prompt: { text: "Please remember the <private>token</private> decision" },
-    delivery: "immediate",
-  })
+  await runtime.enqueued("ses_root", "msg_inbox_1", userItem("Please remember the <private>token</private> decision", "steer"))
 
   assert.deepEqual(runtime.posts("/prompts").map(({ body }) => body), [
-    { session_id: "ses_root", content: "Please remember the [REDACTED] decision", project: "engram" },
+    { session_id: "ses_root", content: "Please remember the [REDACTED] decision", project: "engram", source_inbox_id: "msg_inbox_1" },
   ])
 })
 
-test("V2 prompt hook redacts a private block that straddles the truncation limit", async (t) => {
+test("V2 ignores non-user inbox items, trivial text, and malformed events", async (t) => {
   const runtime = await setupV2(t, { sessions: new Map([["ses_root", sessionInfo("ses_root")]]) })
-  await runtime.hooks.get("session.prompt")({
-    sessionID: "ses_root",
-    messageID: "msg_1",
-    prompt: { text: `${"a".repeat(1980)}<private>PIN=42</private> trailing` },
-    delivery: "immediate",
+  await runtime.enqueued("ses_root", "msg_synthetic", { type: "synthetic", payload: { text: "Synthetic reminder text for the agent" }, delivery: "queue" })
+  await runtime.enqueued("ses_root", "msg_compaction", { type: "compaction", payload: {}, delivery: "queue" })
+  await runtime.enqueued("ses_root", "msg_move", {
+    type: "move",
+    payload: { location: { directory: "/work/other" }, projectID: PROJECT_ID },
+    delivery: "queue",
   })
+  await runtime.enqueued("ses_root", "msg_short", userItem("too short"))
+  await runtime.enqueued("ses_root", "", userItem("A prompt without a durable inbox identity"))
+  await runtime.events.emit({ type: "session.inbox.enqueued", data: { sessionID: "ses_root", inboxID: "msg_x" } })
+
+  assert.equal(runtime.posts("/prompts").length, 0)
+})
+
+test("V2 ignores inbox items from subagent sessions and other locations", async (t) => {
+  const runtime = await setupV2(t, {
+    sessions: new Map([["ses_root", sessionInfo("ses_root")], ["ses_child", sessionInfo("ses_child", "ses_root")]]),
+  })
+  await runtime.enqueued("ses_child", "msg_child", userItem("Delegated prompt text written by the parent agent"))
+  await runtime.enqueued("ses_root", "msg_elsewhere", userItem("Prompt admitted in another location"), { directory: "/work/other" })
+  await runtime.enqueued("ses_unknown", "msg_unknown", userItem("Prompt for a session this instance cannot resolve"))
+
+  assert.equal(runtime.posts("/prompts").length, 0)
+})
+
+test("V2 keeps distinct inbox items with identical text distinct", async (t) => {
+  const runtime = await setupV2(t, { sessions: new Map([["ses_root", sessionInfo("ses_root")]]) })
+  await runtime.enqueued("ses_root", "msg_inbox_1", userItem("Run the full test suite again please"))
+  await runtime.enqueued("ses_root", "msg_inbox_2", userItem("Run the full test suite again please"))
+
+  assert.deepEqual(runtime.posts("/prompts").map(({ body }) => body.source_inbox_id), ["msg_inbox_1", "msg_inbox_2"])
+})
+
+test("V2 forwards replayed inbox items with the same identity for the server to deduplicate", async (t) => {
+  const runtime = await setupV2(t, { sessions: new Map([["ses_root", sessionInfo("ses_root")]]) })
+  await runtime.enqueued("ses_root", "msg_inbox_1", userItem("Run the full test suite again please"))
+  await runtime.enqueued("ses_root", "msg_inbox_1", userItem("Run the full test suite again please"))
+
+  const prompts = runtime.posts("/prompts").map(({ body }) => body)
+  assert.equal(prompts.length, 2, "no in-memory dedup: the server owns replay identity")
+  assert.deepEqual(prompts[0], prompts[1])
+})
+
+test("V2 treats a deleted inbox identity (409) as a silent no-op without retry", async (t) => {
+  const runtime = await setupV2(t, {
+    sessions: new Map([["ses_root", sessionInfo("ses_root")]]),
+    promptResponse: () => httpResponse({ error: "prompt inbox identity was deleted" }, 409),
+  })
+  const errors = []
+  const originalError = console.error
+  const originalWarn = console.warn
+  console.error = (...args) => errors.push(args)
+  console.warn = (...args) => errors.push(args)
+  t.after(() => { console.error = originalError; console.warn = originalWarn })
+
+  await withTimeout(runtime.enqueued("ses_root", "msg_deleted", userItem("A prompt the user already deleted")), "409 stalled the event loop")
+  await withTimeout(runtime.created("ses_other"), "event after a 409 was not handled")
+
+  assert.equal(runtime.posts("/prompts").length, 1)
+  assert.deepEqual(errors, [])
+  assert.equal(runtime.events.subscriptions.length, 1)
+})
+
+test("V2 inbox capture redacts a private block that straddles the truncation limit", async (t) => {
+  const runtime = await setupV2(t, { sessions: new Map([["ses_root", sessionInfo("ses_root")]]) })
+  await runtime.enqueued("ses_root", "msg_inbox_1", userItem(`${"a".repeat(1980)}<private>PIN=42</private> trailing`))
 
   const prompts = runtime.posts("/prompts").map(({ body }) => body)
   assert.equal(prompts.length, 1)

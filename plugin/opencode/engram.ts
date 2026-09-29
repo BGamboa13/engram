@@ -270,6 +270,11 @@ export function shouldNudgeForObservations(
 
 // ─── Plugin Export ───────────────────────────────────────────────────────────
 
+// Hidden hooks-object key through which the V2 adapter reaches the shared prompt
+// capture. A symbol keeps it out of the V1 hook names OpenCode enumerates.
+const CAPTURE_PROMPT = Symbol("engram.capturePrompt")
+type CapturePrompt = (sourceSessionID: string, content: string, sourceInboxID?: string) => Promise<void>
+
 export const Engram: Plugin = async (ctx) => {
 	let project = "unknown"
 	let projectResolutionError = ""
@@ -541,6 +546,34 @@ export const Engram: Plugin = async (ctx) => {
     return await registration && !invalidSessions.has(sessionId) && !closeRequestedSessions.has(sessionId)
   }
 
+  /**
+   * Capture one user prompt for its authoritative root session. A durable
+   * `sourceInboxID` lets the server treat replays as no-ops and refuse deleted
+   * identities (HTTP 409); engramFetch drops that response like any other failure.
+   */
+  const capturePrompt: CapturePrompt = async (sourceSessionID, content, sourceInboxID) => {
+    const sessionId = await resolveAuthoritativeSessionID(sourceSessionID)
+    // Skip child prompts even when ownership was discovered through the SDK.
+    if (!sessionId || subAgentSessions.has(sourceSessionID)) return
+
+    // Only capture non-trivial prompts (>10 chars)
+    if (content.length <= 10) return
+    const registered = await ensureSession(sessionId, true)
+    const confirmedSessionID = await resolveAuthoritativeSessionID(sourceSessionID)
+    if (!registered || confirmedSessionID !== sessionId) return
+    await engramFetch("/prompts", {
+      method: "POST",
+      body: {
+        session_id: sessionId,
+        // Redact before truncating: a <private> block straddling the
+        // limit would otherwise lose its closing tag and leak.
+        content: truncate(stripPrivateTags(content), 2000),
+        project,
+        ...(sourceInboxID ? { source_inbox_id: sourceInboxID } : {}),
+      },
+    })
+  }
+
   // Try to start engram server if not running
 	try {
 		const expectedID = CONFIGURED_ENGRAM_URL ? "" : localInstanceID()
@@ -579,6 +612,8 @@ export const Engram: Plugin = async (ctx) => {
 	}
 
   return {
+    [CAPTURE_PROMPT]: capturePrompt,
+
 		dispose: async () => {
       disposed = true
 			if (!localReady) return
@@ -642,10 +677,6 @@ export const Engram: Plugin = async (ctx) => {
     // output.parts contains TextPart[] with the actual message text.
 
     "chat.message": async (input, output) => {
-      const sessionId = await resolveAuthoritativeSessionID(input.sessionID)
-      // Skip child prompts even when ownership was discovered through the SDK.
-      if (!sessionId || subAgentSessions.has(input.sessionID)) return
-
       // Extract text from parts (type:"text")
       const content = output.parts
         .filter((p) => p.type === "text")
@@ -658,24 +689,7 @@ export const Engram: Plugin = async (ctx) => {
         ? `${output.message.summary.title ?? ""}\n${output.message.summary.body ?? ""}`.trim()
         : ""
 
-      const finalContent = content || fallback
-
-      // Only capture non-trivial prompts (>10 chars)
-      if (finalContent.length > 10) {
-        const registered = await ensureSession(sessionId, true)
-        const confirmedSessionID = await resolveAuthoritativeSessionID(input.sessionID)
-        if (!registered || confirmedSessionID !== sessionId) return
-        await engramFetch("/prompts", {
-          method: "POST",
-          body: {
-            session_id: sessionId,
-            // Redact before truncating: a <private> block straddling the
-            // limit would otherwise lose its closing tag and leak.
-            content: truncate(stripPrivateTags(finalContent), 2000),
-            project,
-          },
-        })
-      }
+      await capturePrompt(input.sessionID, content || fallback)
     },
 
     // ─── Tool Execution Hook ─────────────────────────────────────
@@ -924,6 +938,21 @@ function v1SessionEvent(event: any, directory: string): any {
   return undefined
 }
 
+// V2 admits each human prompt as a durable `user` inbox item. Its inboxID is the
+// prompt's identity: replays reuse it, distinct items with equal text do not.
+function v2InboxPrompt(event: any, directory: string): { sessionID: string; inboxID: string; text: string } | undefined {
+  if (event?.type !== "session.inbox.enqueued") return undefined
+  // The envelope location is optional; the authoritative session lookup still
+  // rejects sessions outside this instance's project.
+  if (event.location?.directory && event.location.directory !== directory) return undefined
+  const data = event.data
+  const item = data?.item
+  if (typeof data?.sessionID !== "string" || !data.sessionID) return undefined
+  if (typeof data.inboxID !== "string" || !data.inboxID) return undefined
+  if (item?.type !== "user" || typeof item.payload?.text !== "string") return undefined
+  return { sessionID: data.sessionID, inboxID: data.inboxID, text: item.payload.text.trim() }
+}
+
 // The V2 event stream ends or throws when the server restarts; reconnect with
 // a bounded doubling delay that resets once events flow again.
 const V2_EVENT_RETRY_MIN_MS = 50
@@ -943,7 +972,7 @@ function delayUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 async function setupEngramV2(ctx: V2Context): Promise<() => Promise<void>> {
-  const hooks: Record<string, any> = await Engram({
+  const hooks: Record<string | symbol, any> = await Engram({
     directory: ctx.location.directory,
     project: { id: ctx.location.project?.id },
     client: {
@@ -971,13 +1000,8 @@ async function setupEngramV2(ctx: V2Context): Promise<() => Promise<void>> {
   }
 
   try {
-    registrations.push(await ctx.session.hook("prompt", async (prompt) => {
-      await hooks["chat.message"]({ sessionID: prompt.sessionID }, {
-        message: {},
-        parts: [{ type: "text", text: prompt.prompt?.text ?? "" }],
-      })
-    }))
-
+    // No `prompt` hook: it lacks a durable identity, so prompts are captured
+    // from `session.inbox.enqueued` below instead.
     registrations.push(await ctx.session.hook("context", async (request) => {
       await withSystemStrings(request.system, (system) =>
         hooks["experimental.chat.system.transform"]({ sessionID: request.sessionID, model: request.model }, { system }))
@@ -1010,6 +1034,8 @@ async function setupEngramV2(ctx: V2Context): Promise<() => Promise<void>> {
             if (abort.signal.aborted) break
             retryMs = V2_EVENT_RETRY_MIN_MS
             try {
+              const prompt = v2InboxPrompt(event, ctx.location.directory)
+              if (prompt) await (hooks[CAPTURE_PROMPT] as CapturePrompt)(prompt.sessionID, prompt.text, prompt.inboxID)
               const translated = v1SessionEvent(event, ctx.location.directory)
               if (translated) await hooks.event({ event: translated })
             } catch {
