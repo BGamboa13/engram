@@ -1032,7 +1032,9 @@ async function setupEngramV2(ctx: V2Context): Promise<() => Promise<void>> {
         try {
           for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
             if (abort.signal.aborted) break
-            retryMs = V2_EVENT_RETRY_MIN_MS
+            // Every subscription opens with a server.connected handshake; only a
+            // real event proves the stream is healthy enough to reset the backoff.
+            if (event?.type !== "server.connected") retryMs = V2_EVENT_RETRY_MIN_MS
             try {
               const prompt = v2InboxPrompt(event, ctx.location.directory)
               if (prompt) await (hooks[CAPTURE_PROMPT] as CapturePrompt)(prompt.sessionID, prompt.text, prompt.inboxID)

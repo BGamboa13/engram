@@ -28,6 +28,7 @@ function eventStream() {
   let pulled
   let closed = false
   let interrupt
+  let handshake = false
   const subscriptions = []
   const settle = (result) => {
     const resolve = waiting
@@ -45,10 +46,16 @@ function eventStream() {
         closed = true
         if (waiting) settle({ value: undefined, done: true })
       })
+      // OpenCode 2.x opens every subscription with a server.connected handshake.
+      let greet = handshake
       return {
         [Symbol.asyncIterator]() {
           return {
             next() {
+              if (greet) {
+                greet = false
+                return Promise.resolve({ value: { type: "server.connected", data: {} }, done: false })
+              }
               pulled?.()
               pulled = undefined
               if (interrupt) {
@@ -86,11 +93,28 @@ function eventStream() {
       if (waiting) settle(error)
       else interrupt = error
     },
+    withHandshake() {
+      handshake = true
+    },
     closeForever() {
       closed = true
       if (waiting) settle({ value: undefined, done: true })
     },
   }
+}
+
+// Records the reconnect delays the plugin schedules, so backoff is asserted as
+// a schedule rather than by counting subscriptions within a real-time window.
+const RECONNECT_DELAYS = new Set([50, 100, 200, 400, 800, 1600, 3200, 5000])
+function recordReconnectDelays(t) {
+  const original = globalThis.setTimeout
+  const delays = []
+  globalThis.setTimeout = (callback, ms, ...args) => {
+    if (RECONNECT_DELAYS.has(ms)) delays.push(ms)
+    return original(callback, ms, ...args)
+  }
+  t.after(() => { globalThis.setTimeout = original })
+  return delays
 }
 
 function withTimeout(promise, message, ms = 1000) {
@@ -480,13 +504,29 @@ test("V2 keeps listening when handling one event throws", async (t) => {
 })
 
 test("V2 backs off between re-subscriptions and stops after cleanup", async (t) => {
+  const delays = recordReconnectDelays(t)
   const runtime = await setupV2(t)
   runtime.events.closeForever()
-  await new Promise((resolve) => setTimeout(resolve, 300))
+  try {
+    await waitFor(() => delays.length >= 3, "plugin did not keep re-subscribing", 5000)
+    assert.deepEqual(delays.slice(0, 3), [50, 100, 200])
+  } finally {
+    await withTimeout(runtime.cleanup(), "cleanup waited on the reconnect backoff")
+  }
   const attempts = runtime.events.subscriptions.length
-  assert.ok(attempts >= 2 && attempts <= 6, `expected bounded re-subscription attempts, got ${attempts}`)
-
-  await withTimeout(runtime.cleanup(), "cleanup waited on the reconnect backoff")
-  await new Promise((resolve) => setTimeout(resolve, 150))
+  await new Promise((resolve) => setTimeout(resolve, 20))
   assert.equal(runtime.events.subscriptions.length, attempts, "no re-subscription after cleanup")
+})
+
+test("V2 keeps backing off when each subscription only delivers the server handshake", async (t) => {
+  const delays = recordReconnectDelays(t)
+  const runtime = await setupV2(t)
+  runtime.events.withHandshake()
+  runtime.events.closeForever()
+  try {
+    await waitFor(() => delays.length >= 3, "plugin did not keep re-subscribing", 5000)
+    assert.deepEqual(delays.slice(0, 3), [50, 100, 200], "server.connected must not reset the backoff")
+  } finally {
+    await withTimeout(runtime.cleanup(), "cleanup waited on the reconnect backoff")
+  }
 })
