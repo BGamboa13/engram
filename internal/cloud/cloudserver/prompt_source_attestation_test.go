@@ -39,6 +39,72 @@ func (s *attestationTestStore) AttestPromptSource(_ context.Context, _, _, _, _,
 	return &cloudstore.PromptSourceAttestation{ID: 42, ActorID: actor}, nil
 }
 
+type verifyAttestationStore struct {
+	attestationTestStore
+	calls  int
+	found  bool
+	err    error
+	id     int64
+	fields [5]string
+}
+
+func (s *verifyAttestationStore) VerifyPromptSourceAttestation(_ context.Context, id int64, session, inbox, syncID, owner, prompt string) (bool, error) {
+	s.calls++
+	s.id = id
+	s.fields = [5]string{session, inbox, syncID, owner, prompt}
+	return s.found, s.err
+}
+
+func TestVerifyPromptSourceAttestationRoute(t *testing.T) {
+	body := `{"audit_id":42,"session_id":"session","source_inbox_id":"inbox","sync_id":"sync","owner_project":"alpha","prompt_project":"beta"}`
+	human := cloudauth.Principal{ID: "human", Kind: cloudauth.PrincipalKindHuman, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}
+	service := cloudauth.Principal{ID: "service", Kind: cloudauth.PrincipalKindServiceAccount, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}
+	cases := []struct {
+		name, body    string
+		principal     cloudauth.Principal
+		grants        []string
+		found         bool
+		err           error
+		limit         int64
+		status, calls int
+	}{
+		{name: "human exact", body: body, principal: human, grants: []string{"alpha", "beta"}, found: true, status: 200, calls: 1},
+		{name: "service exact", body: body, principal: service, grants: []string{"alpha", "beta"}, found: true, status: 200, calls: 1},
+		{name: "missing row", body: body, principal: human, grants: []string{"alpha", "beta"}, status: 409, calls: 1},
+		{name: "store error", body: body, principal: human, grants: []string{"alpha", "beta"}, err: errors.New("unavailable"), status: 500, calls: 1},
+		{name: "owner denied", body: body, principal: human, grants: []string{"beta"}, status: 403},
+		{name: "prompt denied", body: body, principal: human, grants: []string{"alpha"}, status: 403},
+		{name: "missing principal", body: body, status: 401},
+		{name: "unidentified", body: body, principal: cloudauth.Principal{Kind: cloudauth.PrincipalKindServiceAccount}, status: 401},
+		{name: "zero id", body: strings.Replace(body, `42`, `0`, 1), principal: human, grants: []string{"alpha", "beta"}, status: 400},
+		{name: "fractional id", body: strings.Replace(body, `42`, `1.5`, 1), principal: human, grants: []string{"alpha", "beta"}, status: 400},
+		{name: "missing field", body: strings.Replace(body, `"sync"`, `""`, 1), principal: human, grants: []string{"alpha", "beta"}, status: 400},
+		{name: "unknown field", body: strings.TrimSuffix(body, "}") + `,"actor_id":"spoof"}`, principal: human, grants: []string{"alpha", "beta"}, status: 400},
+		{name: "trailing", body: body + ` {}`, principal: human, grants: []string{"alpha", "beta"}, status: 400},
+		{name: "oversized", body: body, principal: human, grants: []string{"alpha", "beta"}, limit: 20, status: 413},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &verifyAttestationStore{found: tc.found, err: tc.err}
+			opts := []Option{WithPrincipalProjectAuthorizer(managedGrantAuthorizer{grants: map[string][]string{tc.principal.ID: tc.grants}})}
+			if tc.limit > 0 {
+				opts = append(opts, WithMaxPushBodyBytes(tc.limit))
+			}
+			srv := New(st, claimAuthOnly{}, 0, opts...)
+			req := httptest.NewRequest(http.MethodPost, "/sync/prompt-source-attestations/verify", strings.NewReader(tc.body))
+			req = req.WithContext(WithPrincipal(req.Context(), tc.principal))
+			w := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(w, req)
+			if w.Code != tc.status || st.calls != tc.calls || st.registration != 0 || st.claim != 0 || st.attest != 0 {
+				t.Fatalf("status=%d body=%q verify=%d writes=%d/%d/%d", w.Code, w.Body.String(), st.calls, st.registration, st.claim, st.attest)
+			}
+			if tc.status == 200 && (st.id != 42 || st.fields != [5]string{"session", "inbox", "sync", "alpha", "beta"} || !strings.Contains(w.Body.String(), `"status":"ok"`)) {
+				t.Fatalf("verification response=%q id=%d fields=%v", w.Body.String(), st.id, st.fields)
+			}
+		})
+	}
+}
+
 func TestPromptSourceAttestationBearerBoundary(t *testing.T) {
 	body := `{"session_id":"session","source_inbox_id":"inbox","sync_id":"sync","owner_project":"alpha","prompt_project":"beta"}`
 	human := cloudauth.Principal{ID: "human", Kind: cloudauth.PrincipalKindHuman, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}

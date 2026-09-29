@@ -24,6 +24,28 @@ type PromptSourceAttestation struct {
 	AttestedAt    time.Time
 }
 
+// VerifyPromptSourceAttestation checks only the immutable audit row identity.
+// Authorization of both projects must happen before this global lookup.
+func (cs *CloudStore) VerifyPromptSourceAttestation(ctx context.Context, id int64, sessionID, sourceInboxID, syncID, ownerProject, promptProject string) (bool, error) {
+	if cs == nil || cs.db == nil {
+		return false, fmt.Errorf("cloudstore: not initialized")
+	}
+	if id <= 0 || sessionID == "" || sourceInboxID == "" || syncID == "" || ownerProject == "" || promptProject == "" {
+		return false, nil
+	}
+	var found int
+	err := cs.db.QueryRowContext(ctx, `SELECT 1 FROM cloud_prompt_source_attestations
+  WHERE id = $1 AND session_id = $2 AND source_inbox_id = $3 AND sync_id = $4
+  AND owner_project = $5 AND prompt_project = $6`, id, sessionID, sourceInboxID, syncID, ownerProject, promptProject).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("cloudstore: verify prompt source attestation: %w", err)
+	}
+	return found == 1, nil
+}
+
 // AttestPromptSource records an already-authorized human assertion. Storage
 // does not check grants: the future authenticated server route must verify the
 // actor's current grants to both owner and prompt projects before calling it.
