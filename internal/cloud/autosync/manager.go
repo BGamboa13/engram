@@ -106,6 +106,39 @@ type irreparableSyncMutationQuarantiner interface {
 	QuarantineIrreparableSyncMutations(targetKey, project string, apply bool) (store.SyncMutationQuarantineReport, error)
 }
 
+// promptPreflightError means this entry was rejected before transport and remains pending.
+type promptPreflightError struct{ err error }
+
+func (e *promptPreflightError) Error() string { return e.err.Error() }
+func (e *promptPreflightError) Unwrap() error { return e.err }
+
+// Only a tree made entirely of known per-entry denials may bypass the push gate.
+func safeOutboundBlock(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch e := err.(type) {
+	case *nonEnrolledPendingError, *promptPreflightError:
+		return true
+	case interface{ Unwrap() []error }:
+		children := e.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !safeOutboundBlock(child) {
+				return false
+			}
+		}
+		return true
+	default:
+		if inner := errors.Unwrap(err); inner != nil {
+			return safeOutboundBlock(inner)
+		}
+		return false
+	}
+}
+
 type nonEnrolledPendingError struct {
 	counts []store.PendingSyncMutationProjectCount
 }
@@ -508,25 +541,28 @@ func (m *Manager) cycle(ctx context.Context) {
 	m.leaseHeld = true
 	m.mu.Unlock()
 
-	// Push, then pull. A typed non-enrollment block applies only to outbound
-	// mutations, so inbound replication can still progress without changing the
-	// final degraded state that explains the blocked outbound backlog.
+	// Only exclusively local per-entry preflight blocks can leave inbound
+	// replication independent of the outbound failure.
 	if err := m.push(ctx); err != nil {
-		var blocked *nonEnrolledPendingError
-		if !errors.As(err, &blocked) {
+		if !safeOutboundBlock(err) {
 			reasonCode := classifyTransportError(err)
 			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("push: %v", err), err), reasonCode)
 			return
 		}
 
 		blockedMessage := err.Error()
-		m.recordBlocked(blockedMessage, constants.ReasonNonEnrolledPendingMutations)
+		blockedReason := constants.ReasonNonEnrolledPendingMutations
+		var nonEnrolled *nonEnrolledPendingError
+		if !errors.As(err, &nonEnrolled) {
+			blockedReason = "prompt_provenance_blocked"
+		}
+		m.recordBlocked(blockedMessage, blockedReason)
 		if err := m.pullPreservingSyncState(ctx); err != nil {
 			reasonCode := classifyTransportError(err)
 			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("pull: %v", err), err), reasonCode)
 			return
 		}
-		if err := m.recordBlockedAfterSuccess(blockedMessage, constants.ReasonNonEnrolledPendingMutations); err != nil {
+		if err := m.recordBlockedAfterSuccess(blockedMessage, blockedReason); err != nil {
 			reasonCode := classifyTransportError(err)
 			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("persist blocked state after successful pull: %v", err), err), reasonCode)
 		}
@@ -772,7 +808,7 @@ func (m *Manager) pushPage(ctx context.Context, pending []store.SyncMutation) []
 func (m *Manager) preflightPrompt(mut store.SyncMutation, syncID, session, inbox, project string) error {
 	if syncID == "" || session == "" || inbox == "" || project == "" ||
 		syncID != mut.EntityKey || project != mut.Project {
-		return fmt.Errorf("unverified keyed prompt mutation identity")
+		return &promptPreflightError{err: fmt.Errorf("unverified keyed prompt mutation identity")}
 	}
 	local, ok := m.store.(localPromptProvenance)
 	if !ok {
@@ -787,14 +823,14 @@ func (m *Manager) preflightPrompt(mut store.SyncMutation, syncID, session, inbox
 		return fmt.Errorf("read local prompt origin: %w", err)
 	}
 	if !eligible || originalSession != session || originalInbox != inbox || originalProject != project {
-		return fmt.Errorf("unverified keyed prompt origin")
+		return &promptPreflightError{err: fmt.Errorf("unverified keyed prompt origin")}
 	}
 	owner, eligible, err := local.LocalSessionProvenance(session)
 	if err != nil {
 		return fmt.Errorf("read local session origin: %w", err)
 	}
 	if !eligible || owner == "" {
-		return fmt.Errorf("unverified local session owner")
+		return &promptPreflightError{err: fmt.Errorf("unverified local session owner")}
 	}
 	if err := remote.RegisterSessionAuthority(session, owner); err != nil {
 		return fmt.Errorf("register session authority: %w", err)
