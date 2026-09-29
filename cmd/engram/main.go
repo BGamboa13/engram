@@ -316,6 +316,14 @@ type mutationTransportAdapter struct {
 	remote *remote.MutationTransport
 }
 
+func (a *mutationTransportAdapter) RegisterSessionAuthority(sessionID, ownerProject string) error {
+	return a.remote.RegisterSessionAuthority(sessionID, ownerProject)
+}
+
+func (a *mutationTransportAdapter) ClaimPromptPair(sessionID, inboxID, syncID, ownerProject, promptProject string) error {
+	return a.remote.ClaimPromptPair(sessionID, inboxID, syncID, ownerProject, promptProject)
+}
+
 func (a *mutationTransportAdapter) PushMutations(entries []autosync.MutationEntry) (*autosync.PushMutationsResult, error) {
 	remoteEntries := make([]remote.MutationEntry, len(entries))
 	for i, e := range entries {

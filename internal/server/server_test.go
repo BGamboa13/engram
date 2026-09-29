@@ -2088,6 +2088,85 @@ func TestSyncStatusResolvesProjectSelectors(t *testing.T) {
 	}
 }
 
+func TestPromptInboxIdentityHTTP(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	h := srv.Handler()
+	var writes atomic.Int32
+	srv.SetOnWrite(func() { writes.Add(1) })
+	if err := st.CreateSession("inbox-http", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	request := func(body string) (int, string) {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/prompts", strings.NewReader(body)))
+		return rec.Code, rec.Body.String()
+	}
+	payload := `{"session_id":"inbox-http","project":"engram","content":"same","source_inbox_id":"a"}`
+	code, first := request(payload)
+	if code != http.StatusCreated || writes.Load() != 1 {
+		t.Fatalf("first: %d %s writes=%d", code, first, writes.Load())
+	}
+	var created struct {
+		ID     int64  `json:"id"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(first), &created); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
+	if created.ID <= 0 || created.Status != "saved" {
+		t.Fatalf("first response: id=%d status=%q body=%s", created.ID, created.Status, first)
+	}
+	code, replay := request(payload)
+	if code != http.StatusCreated || replay != first || writes.Load() != 1 {
+		t.Fatalf("replay: %d %s writes=%d", code, replay, writes.Load())
+	}
+	code, rejected := request(`{"session_id":"inbox-http","project":"other","content":"same","source_inbox_id":"a"}`)
+	var rejection map[string]string
+	if err := json.Unmarshal([]byte(rejected), &rejection); err != nil {
+		t.Fatalf("decode wrong-project response: %v", err)
+	}
+	if code != http.StatusBadRequest || rejection["code"] != "session_project_mismatch" ||
+		rejection["error"] != "session project does not match requested project" || writes.Load() != 1 {
+		t.Fatalf("wrong project: %d %s writes=%d", code, rejected, writes.Load())
+	}
+}
+
+func TestPromptInboxDeletedReplayHTTP(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	h := srv.Handler()
+	if err := st.CreateSession("deleted-http", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := st.AddPrompt(store.AddPromptParams{SessionID: "deleted-http", Project: "engram", Content: "same", SourceInboxID: "one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeletePrompt(id); err != nil {
+		t.Fatal(err)
+	}
+	var writes atomic.Int32
+	srv.SetOnWrite(func() { writes.Add(1) })
+	var before, after int
+	if err := st.DB().QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/prompts", strings.NewReader(`{"session_id":"deleted-http","project":"engram","content":"same","source_inbox_id":"one"}`)))
+	if rec.Code != http.StatusConflict || strings.Contains(rec.Body.String(), `"id"`) || writes.Load() != 0 {
+		t.Fatalf("replay: status=%d body=%s writes=%d", rec.Code, rec.Body.String(), writes.Load())
+	}
+	if err := st.DB().QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&after); err != nil || after != before {
+		t.Fatalf("mutations %d -> %d: %v", before, after, err)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/prompts", strings.NewReader(`{"session_id":"deleted-http","project":"engram","content":"same","source_inbox_id":"two"}`)))
+	if rec.Code != http.StatusCreated || writes.Load() != 1 {
+		t.Fatalf("new ID: status=%d body=%s writes=%d", rec.Code, rec.Body.String(), writes.Load())
+	}
+}
+
 // ─── OnWrite Notification Tests ──────────────────────────────────────────────
 
 func TestOnWriteCalledAfterSuccessfulWrites(t *testing.T) {
