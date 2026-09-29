@@ -112,7 +112,7 @@ func cmdCloudAttestPromptSource(cfg store.Config) {
 		fatal(fmt.Errorf("local store unavailable: %w", err))
 		return
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	if err := attestPromptSource(s, args[1], args[3], endpoint, transport, os.Stdin, os.Stdout); err != nil {
 		fatal(err)
 	}

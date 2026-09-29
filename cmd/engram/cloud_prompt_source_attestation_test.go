@@ -42,7 +42,7 @@ func TestPromptSourceAttestationNoPreview(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	remote := &fakePromptAttester{id: 42}
 	var out bytes.Buffer
 	err = attestPromptSource(s, "missing", "owner", "https://cloud.example.test", remote, strings.NewReader("yes\n"), &out)
@@ -67,7 +67,7 @@ func TestPromptSourceAttestationOutputFailures(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer s.Close()
+			defer func() { _ = s.Close() }()
 			if err := s.CreateSession("session", "owner", "/work"); err != nil {
 				t.Fatal(err)
 			}
@@ -124,7 +124,7 @@ func TestPromptSourceAttestationConfirmation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer s.Close()
+			defer func() { _ = s.Close() }()
 			if err := s.CreateSession("session", "owner", "/work"); err != nil {
 				t.Fatal(err)
 			}
