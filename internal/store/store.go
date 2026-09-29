@@ -5810,7 +5810,7 @@ func (s *Store) exportWithProjectScope(project string) (_ *ExportData, err error
 	if err != nil {
 		return nil, fmt.Errorf("export sessions: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var sess Session
 		if err := rows.Scan(&sess.ID, &sess.Project, &sess.Directory, &sess.OwnershipMode, &sess.StartedAt, &sess.EndedAt, &sess.Summary); err != nil {
