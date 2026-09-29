@@ -379,6 +379,60 @@ func (mt *MutationTransport) ClaimPromptPair(sessionID, sourceInboxID, syncID, o
 	}{sessionID, sourceInboxID, syncID, ownerProject, promptProject})
 }
 
+// AttestPromptSource records the server-issued identity for a prompt source.
+func (mt *MutationTransport) AttestPromptSource(sessionID, sourceInboxID, syncID, ownerProject, promptProject string) (int64, error) {
+	const operation = "attest prompt source"
+	for _, field := range []string{sessionID, sourceInboxID, syncID, ownerProject, promptProject} {
+		if strings.TrimSpace(field) == "" {
+			return 0, fmt.Errorf("cloud: %s: all fields are required", operation)
+		}
+	}
+	body, err := json.Marshal(struct {
+		SessionID     string `json:"session_id"`
+		SourceInboxID string `json:"source_inbox_id"`
+		SyncID        string `json:"sync_id"`
+		OwnerProject  string `json:"owner_project"`
+		PromptProject string `json:"prompt_project"`
+	}{sessionID, sourceInboxID, syncID, ownerProject, promptProject})
+	if err != nil {
+		return 0, fmt.Errorf("cloud: marshal %s: %w", operation, err)
+	}
+	req, err := http.NewRequest(http.MethodPost, mt.baseURL+"/sync/prompt-source-attestations", bytes.NewReader(body))
+	if err != nil {
+		return 0, fmt.Errorf("cloud: build %s request", operation)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	mt.setAuthorization(req)
+	resp, err := mt.httpClient.Do(req)
+	if err != nil {
+		// HTTP client errors may include server-controlled URLs or redirect text.
+		return 0, fmt.Errorf("cloud: %s request failed", operation)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return 0, &HTTPStatusError{Operation: operation, StatusCode: resp.StatusCode, Body: http.StatusText(resp.StatusCode)}
+	}
+	const maxResponseBytes = 64 << 10
+	response, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil || len(response) > maxResponseBytes {
+		return 0, fmt.Errorf("cloud: invalid %s response", operation)
+	}
+	var result struct {
+		Status        string `json:"status"`
+		AttestationID int64  `json:"attestation_id"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(response))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil || result.Status != "ok" || result.AttestationID <= 0 {
+		return 0, fmt.Errorf("cloud: invalid %s response", operation)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return 0, fmt.Errorf("cloud: invalid %s response", operation)
+	}
+	return result.AttestationID, nil
+}
+
 func (mt *MutationTransport) postProvenance(operation, path string, payload any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
