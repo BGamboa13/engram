@@ -902,7 +902,9 @@ function v2ToolResultText(result: any): string {
     : Array.isArray(result?.content)
     ? result.content.filter((part: any) => part?.type === "text").map((part: any) => part.text ?? "").join("\n")
     : ""
-  return text || (result?.output === undefined ? "" : JSON.stringify(result.output))
+  if (text) return text
+  if (typeof result?.output === "string") return result.output
+  return result?.output === undefined ? "" : JSON.stringify(result.output)
 }
 
 // V2 session events carry `data.sessionID`; V1 hooks expect `properties.info.id`.

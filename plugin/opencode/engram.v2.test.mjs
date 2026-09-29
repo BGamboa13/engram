@@ -319,6 +319,24 @@ test("V2 tool hook captures subagent output returned as string content", async (
   ])
 })
 
+test("V2 tool hook captures a plain string output without JSON quoting", async (t) => {
+  const runtime = await setupV2(t, { sessions: new Map([["ses_root", sessionInfo("ses_root")]]) })
+  const output = "Subagent finished: only a plain string output was returned by the tool."
+  await runtime.hooks.get("tool.execute.after")({
+    tool: "subagent",
+    sessionID: "ses_root",
+    agent: "build",
+    messageID: "msg_4",
+    id: "call_4",
+    input: {},
+    status: "completed",
+    result: { content: "", output },
+  })
+  assert.deepEqual(runtime.posts("/observations/passive").map(({ body }) => body), [
+    { session_id: "ses_root", content: output, project: "engram", source: "task-complete" },
+  ])
+})
+
 test("V2 tool hook rejects Engram writes without an authoritative session", async (t) => {
   const runtime = await setupV2(t)
   const call = { tool: "engram_mem_save", sessionID: "ses_missing", input: {} }
