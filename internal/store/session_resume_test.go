@@ -63,7 +63,7 @@ func TestResumeSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reopened.Close()
+	defer func() { _ = reopened.Close() }()
 	if got, err := reopened.ResumeSessionWithOwnershipMode("root", "engram", "/work", SessionOwnershipProjectOwned); err != nil || got != "root:resume:3" {
 		t.Fatalf("reopen: %q %v", got, err)
 	}

@@ -3145,7 +3145,7 @@ func continuationSessionTx(tx *sql.Tx, root string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	max := big.NewInt(1)
 	var liveOrdinal *big.Int
 	liveID := ""
