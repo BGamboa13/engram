@@ -781,6 +781,16 @@ func (cs *CloudStore) migrate(ctx context.Context) error {
 			claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			PRIMARY KEY (session_id, source_inbox_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS cloud_prompt_source_attestations (
+			id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			source_inbox_id TEXT NOT NULL,
+			sync_id TEXT NOT NULL,
+			owner_project TEXT NOT NULL,
+			prompt_project TEXT NOT NULL,
+			actor_id TEXT NOT NULL,
+			attested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
 		`CREATE TABLE IF NOT EXISTS cloud_project_sessions (
 			project_name TEXT NOT NULL,
 			session_id TEXT NOT NULL,
