@@ -196,7 +196,7 @@ jobs:
 
       # Covers the dual-major (1.x server / 2.x setup) OpenCode adapter.
       - name: Run OpenCode plugin tests
-        run: node --test plugin/opencode/engram.test.mjs plugin/opencode/engram.v2.test.mjs
+        run: node --test plugin/opencode/engram.test.mjs plugin/opencode/engram.v2.test.mjs plugin/opencode/engram.v2.real-server.test.mjs
 
   perf-ratchet:
     name: Performance Ratchet
