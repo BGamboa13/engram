@@ -329,11 +329,10 @@ export const Engram: Plugin = async (ctx) => {
   const registrationAttempts = new Set<string>()
   const registeringSessions = new Map<string, Promise<boolean>>()
   // Ownership/lifecycle sets remain keyed by OpenCode root, never by a suffix.
-  const effectiveSessions = new Map<string, { id: string; ordinal: number }>()
+  const effectiveSessions = new Map<string, { id: string }>()
   const cleanupSessions = new Map<string, Set<string>>()
   const registrationErrors = new Map<string, string>()
   const warnedSessions = new Set<string>()
-  const MAX_SESSION_ORDINAL = 32
 
   function registrationFailed(sessionId: string, cause: string): false {
     registrationErrors.set(sessionId, cause)
@@ -546,13 +545,13 @@ export const Engram: Plugin = async (ctx) => {
   }
 
   /**
-   * Ensure a session exists in engram. Idempotent — calls POST /sessions
-   * which uses INSERT OR IGNORE. Safe to call multiple times.
+   * Register or renew the root through the core resume API, retaining only
+   * its acknowledged effective identity for session-bound writes.
    *
    * Silently skips sub-agent sessions (tracked in `subAgentSessions`).
    */
   async function ensureSession(sessionId: string, renew = false): Promise<boolean> {
-      if (disposed || !await ensureResolvedProject() || disposed) return false
+    if (disposed || !await ensureResolvedProject() || disposed) return false
     if (!sessionId || invalidSessions.has(sessionId) || closeRequestedSessions.has(sessionId) || closedSessions.has(sessionId)) return false
     if (!renew && knownSessions.has(sessionId)) return true
     // Do not register sub-agent sessions in Engram (issue #116).
@@ -561,40 +560,30 @@ export const Engram: Plugin = async (ctx) => {
     if (inFlight) return await inFlight && !closeRequestedSessions.has(sessionId)
     registrationAttempts.add(sessionId)
     const registration = (async () => {
-      const previous = effectiveSessions.get(sessionId)
-      let ordinal = previous?.ordinal ?? 1
       const cleanup = cleanupSessions.get(sessionId) ?? new Set<string>()
       cleanupSessions.set(sessionId, cleanup)
       knownSessions.delete(sessionId)
       registrationErrors.delete(sessionId)
-      while (ordinal <= MAX_SESSION_ORDINAL) {
-        const candidate = ordinal === 1 ? sessionId : `${sessionId}:resume:${ordinal}`
-        // An uncertain delivery still needs cleanup, as before (#1131).
-        const owned = cleanup.has(candidate)
-        cleanup.add(candidate)
-        const result = await engramFetchResult("/sessions", {
-          method: "POST",
-          body: { id: candidate, project, directory: ctx.directory },
-        }, true)
-        if (result?.ok && result.body?.id === candidate && result.body?.status === "created") {
-          effectiveSessions.set(sessionId, { id: candidate, ordinal })
-          knownSessions.add(sessionId)
-          return true
-        }
-        const ended = result?.status === 409 && result.body?.code === "session_already_ended"
-        // A refusal only releases an identity this attempt introduced; a failed
-        // renewal of an owned session still needs its /end unless it already ended.
-        if (result && !result.ok && (!owned || ended)) cleanup.delete(candidate)
-        if (ended) {
-          ordinal++
-          continue
-        }
-        const cause = result?.status === 409 && result.body?.code === "session_project_conflict"
-          ? "HTTP 409 session_project_conflict"
-          : result && !result.ok ? `HTTP ${result.status} session registration refused` : "session registration was not acknowledged"
-        return registrationFailed(sessionId, cause)
+      const result = await engramFetchResult("/sessions", {
+        method: "POST",
+        body: { id: sessionId, project, directory: ctx.directory, resume: true },
+      }, true)
+      const id = result?.body?.id
+      if (result?.ok && result.body?.status === "created" && typeof id === "string" &&
+          (id === sessionId || id.startsWith(`${sessionId}:resume:`))) {
+        effectiveSessions.set(sessionId, { id })
+        cleanup.add(id)
+        knownSessions.add(sessionId)
+        return true
       }
-      return registrationFailed(sessionId, `HTTP 409 session_already_ended: exhausted ${MAX_SESSION_ORDINAL} session identities`)
+      // Failed or uncertain renewals retain previously acknowledged cleanup
+      // ownership. The server chooses new identities, so a newly created but
+      // unacknowledged continuation may remain open; never guess its identity.
+      const cause = result?.status === 409 &&
+          (result.body?.code === "session_project_conflict" || result.body?.code === "session_already_ended")
+        ? `HTTP 409 ${result.body.code}`
+        : result && !result.ok ? `HTTP ${result.status} session registration refused` : "session registration was not acknowledged"
+      return registrationFailed(sessionId, cause)
     })().finally(() => registeringSessions.delete(sessionId))
     registeringSessions.set(sessionId, registration)
     return await registration && !invalidSessions.has(sessionId) && !closeRequestedSessions.has(sessionId)

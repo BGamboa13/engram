@@ -224,12 +224,13 @@ function sessionInfo(id, parentID) {
 test("V2 resumed inbox capture retains durable source identity", async (t) => {
   const runtime = await setupV2(t, {
     sessions: new Map([["ses_root", sessionInfo("ses_root")]]),
-    registrationResponse: ({ id }) => id === "ses_root"
-      ? httpResponse({ code: "session_already_ended" }, 409) : httpResponse({ id, status: "created" }),
+    registrationResponse: () => httpResponse({ id: "ses_root:resume:2", status: "created" }),
   })
   await runtime.enqueued("ses_root", "inbox-resumed", { type: "user", payload: { text: "Continue this conversation after restart" }, delivery: "queue" })
   assert.equal(runtime.posts("/prompts")[0].body.session_id, "ses_root:resume:2")
   assert.equal(runtime.posts("/prompts")[0].body.source_inbox_id, "inbox-resumed")
+  assert.equal(runtime.posts("/sessions").length, 1)
+  assert.equal(runtime.posts("/sessions")[0].body.resume, true)
   await runtime.cleanup()
   assert.equal(runtime.posts("/sessions/ses_root%3Aresume%3A2/end").length, 1)
 })
@@ -267,7 +268,7 @@ test("V2 session.created binds root sessions but never child sessions", async (t
   await runtime.created("ses_child", "ses_root")
 
   assert.deepEqual(runtime.posts("/sessions").map(({ body }) => body), [
-    { id: "ses_root", project: "engram", directory: DIRECTORY },
+    { id: "ses_root", project: "engram", directory: DIRECTORY, resume: true },
   ])
 
   await runtime.deleted("ses_root")

@@ -307,11 +307,13 @@ For an accepted `POST /sync/mutations/push`, each future materialized cloud chun
 
 ### Sessions
 
-- `POST /sessions` — Create or renew a runtime session. Body: `{id, project, directory, ownership_mode?}`
+- `POST /sessions` — Create or renew a runtime session. Body: `{id, project, directory, ownership_mode?, resume?}`
   - `ownership_mode` accepts `shared` or `project_owned`; when omitted it defaults to `shared`.
   - A successful create or renewal writes a local 30-minute `runtime_lease_expires_at` without changing the persisted session identity. Leases are local liveness evidence only: they are neither synced nor exported.
   - A `project_owned` registration cannot reuse a session with a nonblank persisted project different from its requested project. It returns `409` with `{error, code:"session_project_conflict", session_id, owner_project, requested_project}` and does not mutate the session or local sync journal. Same-project registration remains idempotent; omitted or `shared` registration retains compatibility for shared sessions.
-  - An ended session is terminal: renewal returns `409` and never reopens it. `POST /sessions/{id}/end` remains the only endpoint that sets `ended_at`.
+  - `resume` is an optional boolean, default `false`. Without it, an ended session returns `409` with `code: "session_already_ended"`; ended rows are never reopened. `POST /sessions/{id}/end` remains the endpoint that sets `ended_at`.
+  - With `resume: true`, a new or live root keeps its ID. For an ended root, the store atomically renews the lowest numeric live `<id>:resume:N` continuation, or creates the next ordinal after the maximum existing numeric suffix (starting at 2, no cap). Non-numeric suffixes and other roots are ignored. The selected continuation follows normal ownership and lease rules; conflicts return `409 session_project_conflict` without advancing further. Concurrent callers converge on one live continuation.
+  - Success remains `201` with `{id, status:"created"}`. A continuation response also includes `resumed_from: <root id>` and returns the effective ID in `id`. Use that acknowledged ID for subsequent session-bound operations. MCP session registration does not opt into resume mode.
   - An invalid non-empty `ownership_mode` returns `400` and does not create a session.
 - `POST /sessions/{id}/end` — End session. Body: `{summary}`
 - `GET /sessions/recent` — Recent sessions. Query: `?project=X&all_projects=true&limit=N`

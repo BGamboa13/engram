@@ -126,6 +126,7 @@ test("V2 inbox prompts stay idempotent and deleted across real server restarts",
   // The plugin keeps one stable URL; the fetch bridge follows server restarts.
   // Project detection is stubbed because the temp directory has no git remote.
   const promptResponses = []
+  const registrations = []
   globalThis.fetch = async (url, init) => {
     const target = new URL(url)
     if (target.origin !== PLUGIN_URL) return originalFetch(url, init)
@@ -133,6 +134,7 @@ test("V2 inbox prompts stay idempotent and deleted across real server restarts",
       return new Response(JSON.stringify({ project: "engram", project_source: "git_remote" }))
     }
     const response = await originalFetch(`${server.url}${target.pathname}${target.search}`, init)
+    if (target.pathname === "/sessions" && init?.method === "POST") registrations.push(JSON.parse(init.body))
     if (target.pathname === "/prompts" && init?.method === "POST") {
       promptResponses.push({ ...JSON.parse(init.body), status: response.status, reply: await response.clone().json() })
     }
@@ -161,7 +163,7 @@ test("V2 inbox prompts stay idempotent and deleted across real server restarts",
     data: { sessionID: "ses_root", inboxID, item: { type: "user", payload: { text }, delivery: "queue" } },
   })
   const prompts = async () => {
-    const response = await originalFetch(`${server.url}/prompts/recent?project=engram&limit=20`)
+    const response = await originalFetch(`${server.url}/prompts/recent?project=engram&limit=100`)
     assert.equal(response.status, 200)
     return response.json()
   }
@@ -200,11 +202,13 @@ test("V2 inbox prompts stay idempotent and deleted across real server restarts",
   assert.equal(promptResponses.at(-1).status, 409)
   assert.equal((await prompts()).length, 1, "deletion survives a restart")
 
-  for (const suffix of [2, 3]) {
+  for (let suffix = 2; suffix <= 41; suffix++) {
     await cleanup()
     events = eventStream()
     cleanup = await setup()
+    const before = registrations.length
     await enqueue(`msg_resumed_${suffix}`)
+    assert.deepEqual(registrations.slice(before), [{ id: "ses_root", project: "engram", directory: dir, resume: true }])
     const captured = promptResponses.at(-1)
     assert.equal(captured.status, 201)
     assert.equal(captured.session_id, `ses_root:resume:${suffix}`)

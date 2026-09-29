@@ -49,6 +49,8 @@ Session ends → Agent writes session summary (Goal/Discoveries/Accomplished/Nex
 Next session starts → Agent may retrieve prior context; a host plugin may inject it
 ```
 
+Runtime registration through `POST /sessions` supports opt-in `resume: true`. Go selects and registers an effective continuation for an ended root inside one SQLite write transaction, preserving terminal rows, ownership checks, and runtime leases. Adapters forward the acknowledged ID rather than choosing suffixes. Ordinary registration and MCP callers retain the ended-session refusal; see the [session API contract](../DOCS.md#sessions).
+
 Context injection depends on the integration and available context: Claude Code with plugin setup can inject prior context at startup when available, while bare MCP does not inject it. Agents can request it with `mem_context`; see [plugin behavior](PLUGINS.md#what-the-plugin-provides-with-setup-vs-bare-mcp) and [adapter boundaries](codebase/integrations.md#runtime-session-identity).
 
 ---

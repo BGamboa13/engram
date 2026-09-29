@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -3113,6 +3114,74 @@ func (s *Store) StartSession(id, project, directory string) error {
 // lease. It preserves the existing session identity and refuses to reopen an
 // ended session; EndSession remains terminal truth.
 func (s *Store) StartSessionWithOwnershipMode(id, project, directory, mode string) error {
+	return s.startSessionRegistration(id, project, directory, mode, false, nil)
+}
+
+// ResumeSessionWithOwnershipMode atomically selects and registers a live runtime
+// identity. Ended rows remain terminal; ordinary and MCP registrations do not opt in.
+func (s *Store) ResumeSessionWithOwnershipMode(id, project, directory, mode string) (string, error) {
+	effective := id
+	err := s.startSessionRegistration(id, project, directory, mode, true, &effective)
+	if err != nil {
+		return "", err
+	}
+	return effective, nil
+}
+
+// continuationSessionTx selects the lowest numeric live continuation, or the
+// next ordinal after all numeric suffixes. Literal prefix comparison avoids SQL
+// wildcard interpretation. Arbitrary precision ordinals impose no restart cap.
+func continuationSessionTx(tx *sql.Tx, root string) (string, error) {
+	var endedAt *string
+	err := tx.QueryRow(`SELECT ended_at FROM sessions WHERE id = ?`, root).Scan(&endedAt)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && endedAt == nil) {
+		return root, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	prefix := root + ":resume:"
+	rows, err := tx.Query(`SELECT id, ended_at FROM sessions WHERE substr(id, 1, length(?)) = ? ORDER BY id`, prefix, prefix)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	max := big.NewInt(1)
+	var liveOrdinal *big.Int
+	liveID := ""
+	for rows.Next() {
+		var id string
+		var ended *string
+		if err := rows.Scan(&id, &ended); err != nil {
+			return "", err
+		}
+		suffix := strings.TrimPrefix(id, prefix)
+		if suffix == "" || strings.IndexFunc(suffix, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
+			continue
+		}
+		n, ok := new(big.Int).SetString(suffix, 10)
+		if !ok {
+			continue
+		}
+		if n.Cmp(max) > 0 {
+			max.Set(n)
+		}
+		if ended == nil && (liveOrdinal == nil || n.Cmp(liveOrdinal) < 0) {
+			liveOrdinal, liveID = n, id
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if liveID != "" {
+		// The normal registration checks this selected identity's ownership;
+		// a conflict must be returned, never skipped by advancing the ordinal.
+		return liveID, nil
+	}
+	return prefix + max.Add(max, big.NewInt(1)).String(), nil
+}
+
+func (s *Store) startSessionRegistration(id, project, directory, mode string, resume bool, effective *string) error {
 	if err := validateSessionID(id); err != nil {
 		return err
 	}
@@ -3125,10 +3194,20 @@ func (s *Store) StartSessionWithOwnershipMode(id, project, directory, mode strin
 	}
 
 	claimed := false
+	root := id
 	err := s.withTx(func(tx *sql.Tx) error {
 		// withTx may retry its callback. Only the outcome of a committed
 		// attempt may become the terminal response.
 		claimed = false
+		id = root
+		if resume {
+			var err error
+			id, err = continuationSessionTx(tx, root)
+			if err != nil {
+				return err
+			}
+			*effective = id
+		}
 		existingProject, existingMode, found, err := sessionOwnershipTx(tx, id)
 		if err != nil {
 			return err
@@ -3183,6 +3262,9 @@ func (s *Store) StartSessionWithOwnershipMode(id, project, directory, mode strin
 				return &SessionProjectConflictError{SessionID: id, OwnerProject: existingProject, RequestedProject: project}
 			}
 			if err := sessionProjectWriteError(id, existingProject, existingMode, project); err != nil {
+				if resume && id != root {
+					return &SessionProjectConflictError{SessionID: id, OwnerProject: existingProject, RequestedProject: project}
+				}
 				return err
 			}
 			var existingDirectory string

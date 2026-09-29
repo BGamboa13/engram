@@ -289,10 +289,8 @@ function registrationFailure(code) {
 
 for (const endedCount of [1, 2]) {
   test(`ended roots advance to resume:${endedCount + 1} for every session-bound hook`, async (t) => {
-    const ended = new Set(["runtime", ...(endedCount === 2 ? ["runtime:resume:2"] : [])])
     const runtime = await createRuntime(t, {
-      registrationResponse: (_attempt, id) => ended.has(id)
-        ? registrationFailure("session_already_ended") : httpResponse({ id, status: "created" }),
+      registrationResponse: () => httpResponse({ id: `runtime:resume:${endedCount + 1}`, status: "created" }),
       contextResponse: () => httpResponse({ context: "resumed context" }),
     })
     const effective = `runtime:resume:${endedCount + 1}`
@@ -311,13 +309,14 @@ for (const endedCount of [1, 2]) {
   })
 }
 
-test("concurrent resumed writes share one deterministic probe sequence", async (t) => {
+test("concurrent resumed writes share one resume request", async (t) => {
   const runtime = await createRuntime(t, {
-    registrationResponse: (_attempt, id) => id === "runtime" ? registrationFailure("session_already_ended") : httpResponse({ id, status: "created" }),
+    registrationResponse: () => httpResponse({ id: "runtime:resume:2", status: "created" }),
   })
   const outputs = [toolOutput(), toolOutput(), toolOutput()]
   await Promise.all(outputs.map((output) => runtime.before({ sessionID: "runtime", tool: "mem_save" }, output)))
-  assert.deepEqual(runtime.registeredIDs, ["runtime", "runtime:resume:2"])
+  assert.deepEqual(runtime.registeredIDs, ["runtime"])
+  assert.equal(runtime.requests.find((r) => r.path === "/sessions").body.resume, true)
   assert.ok(outputs.every((o) => o.args.session_id === "runtime:resume:2"))
 })
 
@@ -333,32 +332,27 @@ for (const code of ["session_project_conflict", "session_already_ended"]) {
       await assert.rejects(runtime.before({ sessionID: "runtime", tool: "mem_save" }, output), new RegExp(code))
       assert.equal(output.args.session_id, MODEL_SESSION_ID)
     }
-    const expected = code === "session_project_conflict" ? 2 : 64
-    assert.equal(runtime.registeredIDs.length, expected)
+    assert.deepEqual(runtime.registeredIDs, ["runtime", "runtime"])
     assert.equal(warnings.length, 1)
-    if (code === "session_project_conflict") assert.ok(runtime.registeredIDs.every((id) => id === "runtime"))
-    else assert.equal(runtime.registeredIDs.at(-1), "runtime:resume:32")
     await runtime.dispose()
     assert.equal(runtime.requests.filter((r) => r.path.endsWith("/end")).length, 0, "rejected registrations do not own cleanup")
   })
 }
 
 test("renewal advances again when another instance ends the effective session", async (t) => {
-  const ended = new Set(["runtime"])
-  const runtime = await createRuntime(t, { registrationResponse: (_attempt, id) => ended.has(id)
-    ? registrationFailure("session_already_ended") : httpResponse({ id, status: "created" }) })
+  let effective = "runtime:resume:2"
+  const runtime = await createRuntime(t, { registrationResponse: () => httpResponse({ id: effective, status: "created" }) })
   const output = toolOutput()
   await runtime.before({ sessionID: "runtime", tool: "mem_save" }, output)
-  ended.add("runtime:resume:2")
+  effective = "runtime:resume:3"
   await runtime.before({ sessionID: "runtime", tool: "mem_save" }, output)
   assert.equal(output.args.session_id, "runtime:resume:3")
 })
 
 test("an uncertain renewal failure keeps cleanup ownership of the registered session", async (t) => {
   let failRenewal = false
-  const runtime = await createRuntime(t, { registrationResponse: (_attempt, id) => id === "runtime"
-    ? registrationFailure("session_already_ended")
-    : failRenewal ? httpResponse({ error: "unavailable" }, false) : httpResponse({ id, status: "created" }) })
+  const runtime = await createRuntime(t, { registrationResponse: () => failRenewal
+    ? httpResponse({ error: "unavailable" }, false) : httpResponse({ id: "runtime:resume:2", status: "created" }) })
   await runtime.before({ sessionID: "runtime", tool: "mem_save" }, toolOutput())
   failRenewal = true
   await assert.rejects(runtime.before({ sessionID: "runtime", tool: "mem_save" }, toolOutput()), /could not confirm/)
@@ -367,9 +361,16 @@ test("an uncertain renewal failure keeps cleanup ownership of the registered ses
     [`/sessions/${encodeURIComponent("runtime:resume:2")}/end`], "a failed renewal must not drop the owned effective session")
 })
 
+test("an uncertain initial resume never guesses a cleanup identity", async (t) => {
+  const runtime = await createRuntime(t, { registrationResponse: () => httpResponse({}, true, undefined, new Error("lost acknowledgement")) })
+  await assert.rejects(runtime.before({ sessionID: "runtime", tool: "mem_save" }, toolOutput()), /could not confirm/)
+  await runtime.dispose()
+  assert.deepEqual(runtime.registeredIDs, ["runtime"])
+  assert.equal(runtime.requests.filter((r) => r.path.endsWith("/end")).length, 0)
+})
+
 test("separate plugin instances converge on the same resumed identity", async (t) => {
-  const options = { registrationResponse: (_attempt, id) => id === "runtime"
-    ? registrationFailure("session_already_ended") : httpResponse({ id, status: "created" }) }
+  const options = { registrationResponse: () => httpResponse({ id: "runtime:resume:2", status: "created" }) }
   const first = await createRuntime(t, options)
   await t.test("second instance", async (t) => {
     const second = await createRuntime(t, options)
@@ -380,19 +381,17 @@ test("separate plugin instances converge on the same resumed identity", async (t
 })
 
 test("unknown refusals and mismatched resumed acknowledgements never advance", async (t) => {
-  for (const response of [registrationFailure("other_conflict"), httpResponse({ id: "foreign", status: "created" }), httpResponse({}, false)]) {
+  for (const response of [registrationFailure("other_conflict"), httpResponse({ id: "foreign", status: "created" }), httpResponse({ id: "runtime-other:resume:2", status: "created" }), httpResponse({ id: "runtime:resume:2", status: "rejected" }), httpResponse({}, false)]) {
     await t.test(JSON.stringify(response), async (t) => {
-      const runtime = await createRuntime(t, { registrationResponse: (_attempt, id) => id === "runtime"
-        ? registrationFailure("session_already_ended") : response })
+      const runtime = await createRuntime(t, { registrationResponse: () => response })
       await assert.rejects(runtime.before({ sessionID: "runtime", tool: "mem_save" }, toolOutput()), /could not confirm/)
-      assert.deepEqual(runtime.registeredIDs, ["runtime", "runtime:resume:2"])
+      assert.deepEqual(runtime.registeredIDs, ["runtime"])
     })
   }
 })
 
 test("resumed save nudge looks up the effective session", async (t) => {
-  const runtime = await createRuntime(t, { registrationResponse: (_attempt, id) => id === "runtime"
-    ? registrationFailure("session_already_ended") : httpResponse({ id, status: "created" }),
+  const runtime = await createRuntime(t, { registrationResponse: () => httpResponse({ id: "runtime:resume:2", status: "created" }),
     nudgeSessionResponse: { started_at: "2020-01-01 00:00:00" }, nudgeObservationsResponse: [] })
   const output = { system: [] }
   await runtime.transform({ sessionID: "runtime" }, { system: [] })
@@ -1046,7 +1045,7 @@ test("write tool hook revalidates leaf and ancestor ownership after registration
       const pending = runtime.before({ tool: "mem_save", sessionID: "leaf" }, output)
       await registration.started
       const mutation = scenario.mutate(runtime)
-      registration.resolve(httpResponse())
+      registration.resolve(httpResponse({ id: "old-root", status: "created" }))
 
       await Promise.all([mutation, assertNoForward(pending, output)])
       if (scenario.name === "root ancestor deleted")
