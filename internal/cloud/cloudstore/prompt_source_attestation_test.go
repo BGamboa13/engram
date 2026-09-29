@@ -6,6 +6,47 @@ import (
 	"testing"
 )
 
+func TestVerifyPromptSourceAttestation(t *testing.T) {
+	cs := openIsolatedCloudStore(t)
+	ctx := context.Background()
+	if err := cs.RegisterSessionAuthority(ctx, "session", "owner", "registrar"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.ClaimPromptPair(ctx, "session", "inbox", "sync", "prompt", "claimer"); err != nil {
+		t.Fatal(err)
+	}
+	row, err := cs.AttestPromptSource(ctx, "session", "inbox", "sync", "owner", "prompt", "human")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		id     int64
+		fields [5]string
+		found  bool
+	}{
+		{"exact", row.ID, [5]string{"session", "inbox", "sync", "owner", "prompt"}, true},
+		{"missing", row.ID + 1, [5]string{"session", "inbox", "sync", "owner", "prompt"}, false},
+		{"wrong inbox", row.ID, [5]string{"session", "other", "sync", "owner", "prompt"}, false},
+		{"wrong owner", row.ID, [5]string{"session", "inbox", "sync", "other", "prompt"}, false},
+		{"wrong prompt", row.ID, [5]string{"session", "inbox", "sync", "owner", "other"}, false},
+		{"wrong session", row.ID, [5]string{"other", "inbox", "sync", "owner", "prompt"}, false},
+		{"wrong sync", row.ID, [5]string{"session", "inbox", "other", "owner", "prompt"}, false},
+		{"invalid id", 0, [5]string{"session", "inbox", "sync", "owner", "prompt"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := tc.fields
+			got, err := cs.VerifyPromptSourceAttestation(ctx, tc.id, f[0], f[1], f[2], f[3], f[4])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.found {
+				t.Fatalf("verified=%v want %v", got, tc.found)
+			}
+		})
+	}
+}
+
 func TestPromptSourceAttestationExactAuthorityAndAppendOnlyAudit(t *testing.T) {
 	cs := openIsolatedCloudStore(t)
 	ctx := context.Background()
