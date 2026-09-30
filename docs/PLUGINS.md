@@ -57,6 +57,8 @@ Automatic OpenCode memory operations remain fail-open. Readiness, server/import 
 
 The V2 adapter forwards `session.updated` as well as `session.created`, allowing the shared handler to close a prior root registration if an update later supplies `parentID`. This behavior is covered by deterministic adapter tests; delayed parent attribution has not been verified in a live V2 runtime.
 
+When `/project/current` reports genuine ambiguity, explicit `mem_save`, `mem_save_prompt`, and `mem_session_summary` calls can reach MCP with the SDK-verified root (or previously acknowledged effective ID) without HTTP preregistration. Explicit project, reason, and token arguments are preserved for Go to validate. Automatic prompt/passive/compaction operations remain disabled. After the explicit tool completes, automatic capture resumes only if `GET /sessions/<effective-id>` acknowledges the expected active project-owned association. A missing, mismatched, ended, or unavailable association never triggers speculative registration: HTTP and MCP may use different stores. This recovery capability is not client authentication; no new HTTP endpoint or persistent grant is involved.
+
 Session closure is confirmed only when the response contains the matching effective session ID and `status: completed`. Empty, malformed, mismatched, and failed responses retain cleanup eligibility for existing lifecycle retries.
 
 ### What the Plugin Does
