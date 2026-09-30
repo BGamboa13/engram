@@ -565,8 +565,10 @@ test("fresh Pi state honors a structured session-project conflict without captur
 
     phase = "project-b";
     await withPluginSandbox("engram-pi-contract-", async ({ sandbox }) => {
-      const { eventHandlers } = await loadPluginHarness(sandbox);
+      const entries = [];
+      const { eventHandlers } = await loadPluginHarness(sandbox, (customType, data) => entries.push({ type: "custom", customType, data }));
       const ctx = runtimeContext(sessionId);
+      ctx.sessionManager.getBranch = () => entries;
       await eventHandlers.get("before_agent_start")(
         { systemPrompt: "base", prompt: "this prompt must not cross the server-owned session boundary" },
         ctx,
@@ -1417,6 +1419,7 @@ test("separate plugin graphs converge on a server-selected continuation", async 
       assert.ok(results.every((result) => result.isError === undefined));
       const id = "dual:resume:2";
       assert.ok(entries.every((entry) => entry.data.effectiveID === id));
+      assert.equal(entries.length, 1, "concurrent graphs must persist only one pending mapping");
       assert.deepEqual(calls.filter((call) => call.path === "/sessions").map((call) => call.body.id), ["dual", "dual"]);
       assert.equal(calls.filter((call) => call.path === "/observations" && call.body.session_id === id).length, 2);
       const fork = runtimeContext("fork-dual");
@@ -1661,6 +1664,13 @@ test("resumed quit adopts core numeric identities and reload retains the persist
       assert.equal(calls.filter((call) => call.path === "/sessions").at(-1).body.resume, true);
       const effectiveID = "resumed:resume:2";
       assert.equal(calls.filter((call) => call.path === "/observations").at(-1).body.session_id, effectiveID);
+      for (let index = 0; index < 5; index++) {
+        const renewed = await second.registeredTools.get("mem_save").execute(`renew-${index}`, { title: "renew", content: "renew" }, undefined, undefined, ctx);
+        assert.equal(renewed.isError, undefined);
+        await second.eventHandlers.get("tool_execution_end")({ toolName: "shell", result: "x".repeat(80) }, ctx);
+      }
+      assert.equal(entries.filter(({ customType, data }) => customType === "engram-effective-session" && data.effectiveID === effectiveID).length, 1,
+        "repeated writes and hook renewals must not grow the mapping log");
       await second.eventHandlers.get("session_compact")({ summary: "resumed compaction summary" });
       const archive = calls.find((call) => call.path === "/observations" && call.body.type === "session_summary");
       assert.ok(archive, "resumed compaction must archive its summary");
@@ -2509,6 +2519,123 @@ test("shutdown waits for resumed registration and rejects attributed writes", as
     globalThis.fetch = originalFetch;
     if (originalUrl === undefined) delete process.env.ENGRAM_URL;
     else process.env.ENGRAM_URL = originalUrl;
+  }
+});
+
+test("hosts without mapping persistence never request core resume", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalUrl = process.env.ENGRAM_URL;
+  process.env.ENGRAM_URL = "http://127.0.0.1:17437";
+  const registrations = [];
+  let children = 0;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    if (path === "/project/current") return new Response(JSON.stringify({ project: "pi" }));
+    if (path === "/sessions") {
+      registrations.push(body);
+      if (body.id === "ended-no-persistence") {
+        if (!body.resume) return new Response(JSON.stringify({ code: "session_already_ended" }), { status: 409 });
+        children++;
+        return new Response(JSON.stringify({ id: `${body.id}:resume:2`, status: "created" }));
+      }
+      return new Response(JSON.stringify({ id: body.id, status: "created" }));
+    }
+    return new Response(JSON.stringify({ id: 1 }));
+  };
+  try {
+    for (const missing of ["appendEntry", "getBranch"]) {
+      await withPluginSandbox("engram-pi-no-persistence-", async ({ sandbox }) => {
+        const { registeredTools } = await loadPluginHarness(sandbox, missing === "appendEntry" ? undefined : () => {});
+        const endedCtx = runtimeContext("ended-no-persistence");
+        const liveCtx = runtimeContext("live-no-persistence");
+        if (missing !== "getBranch") for (const ctx of [endedCtx, liveCtx]) ctx.sessionManager.getBranch = () => [];
+        const save = (ctx) => registeredTools.get("mem_save").execute("no-persistence", { title: "save", content: "save" }, undefined, undefined, ctx);
+        const ended = await save(endedCtx);
+        assert.equal(ended.isError, true);
+        assert.equal(ended.details.data?.code, "session_already_ended");
+        assert.equal((await save(liveCtx)).isError, undefined);
+      });
+    }
+    assert.ok(registrations.every(({ resume }) => resume === false));
+    assert.equal(children, 0, "core must never create an untrackable continuation");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalUrl === undefined) delete process.env.ENGRAM_URL; else process.env.ENGRAM_URL = originalUrl;
+  }
+});
+
+test("persisted legacy continuation renews without appendEntry", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalUrl = process.env.ENGRAM_URL;
+  process.env.ENGRAM_URL = "http://127.0.0.1:17437";
+  const effectiveID = "legacy-read-only:resume:bb1fd7b6-4816-4b42-b40c-81902893f955";
+  const entries = [{ type: "custom", customType: "engram-effective-session", data: { runtimeID: "legacy-read-only", effectiveID, pending: true, project: "pi" } }];
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    calls.push({ path, body });
+    if (path === "/project/current") return new Response(JSON.stringify({ project: "pi" }));
+    if (path === "/sessions") return new Response(JSON.stringify({ id: body.id, status: "created" }));
+    return new Response(JSON.stringify({ id: 1 }));
+  };
+  try {
+    await withPluginSandbox("engram-pi-read-only-mapping-", async ({ sandbox }) => {
+      const { registeredTools, eventHandlers } = await loadPluginHarness(sandbox);
+      const ctx = runtimeContext("legacy-read-only");
+      ctx.sessionManager.getBranch = () => entries;
+      const result = await registeredTools.get("mem_save").execute("legacy", { title: "save", content: "save" }, undefined, undefined, ctx);
+      assert.equal(result.isError, undefined, JSON.stringify(result));
+      assert.equal(calls.find(({ path }) => path === "/observations").body.session_id, effectiveID);
+      await eventHandlers.get("session_shutdown")({}, ctx);
+      assert.ok(calls.some(({ path }) => path === `/sessions/${encodeURIComponent(effectiveID)}/end`));
+      assert.equal(entries.length, 1);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalUrl === undefined) delete process.env.ENGRAM_URL; else process.env.ENGRAM_URL = originalUrl;
+  }
+});
+
+test("explicit end overlapping core resume awaits and ends the acknowledged continuation", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalUrl = process.env.ENGRAM_URL;
+  process.env.ENGRAM_URL = "http://127.0.0.1:17437";
+  const started = deferred();
+  const release = deferred();
+  const calls = [];
+  const entries = [];
+  const effectiveID = "explicit-overlap:resume:2";
+  globalThis.fetch = async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    calls.push(path);
+    if (path === "/project/current") return new Response(JSON.stringify({ project: "pi" }));
+    if (path === "/sessions") { started.resolve(); await release.promise; return new Response(JSON.stringify({ id: effectiveID, status: "created" })); }
+    return new Response(JSON.stringify({ id: 1, status: "ended" }));
+  };
+  try {
+    await withPluginSandbox("engram-pi-explicit-overlap-", async ({ sandbox }) => {
+      const { registeredTools, eventHandlers } = await loadPluginHarness(sandbox, (customType, data) => entries.push({ type: "custom", customType, data }));
+      const ctx = runtimeContext("explicit-overlap");
+      ctx.sessionManager.getBranch = () => entries;
+      const save = registeredTools.get("mem_save").execute("save", { title: "save", content: "save" }, undefined, undefined, ctx);
+      await waitFor(started.promise, "resume registration stalled");
+      const end = registeredTools.get("mem_session_end").execute("end", { id: "explicit-overlap" }, undefined, undefined, ctx);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(calls.filter((path) => path.endsWith("/end")).length, 0);
+      release.resolve();
+      const [, ended] = await Promise.all([save, end]);
+      assert.equal(ended.isError, undefined, JSON.stringify(ended));
+      assert.deepEqual(calls.filter((path) => path.endsWith("/end")), [`/sessions/${encodeURIComponent(effectiveID)}/end`]);
+      assert.equal(entries.at(-1).data.pending, false);
+      await eventHandlers.get("session_shutdown")({}, ctx);
+      assert.equal(calls.filter((path) => path.endsWith("/end")).length, 1);
+    });
+  } finally {
+    release.resolve();
+    globalThis.fetch = originalFetch;
+    if (originalUrl === undefined) delete process.env.ENGRAM_URL; else process.env.ENGRAM_URL = originalUrl;
   }
 });
 
