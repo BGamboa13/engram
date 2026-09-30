@@ -1689,13 +1689,18 @@ func handleUpdate(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 			return mcp.NewToolResultError("provide at least one field to update"), nil
 		}
 
-		detRes, err := resolveWriteProjectWithProcessOverride(s, cfg.DefaultProject, true)
-		if err != nil {
-			return writeProjectErrorResult(nil, "", detRes, err), nil
-		}
 		obs, err := s.GetObservation(id)
 		if err != nil {
 			return mcp.NewToolResultError("Failed to update memory: " + err.Error()), nil
+		}
+
+		detRes, err := resolveWriteProjectWithProcessOverride(s, cfg.DefaultProject, true)
+		// Field updates by ID are anchored on the record identity: when cwd
+		// resolution fails only because the directory is ambiguous, fall back to
+		// the stored project and continue through the ownership check below.
+		detRes, err = storedProjectFallback(obs, detRes, err)
+		if err != nil {
+			return writeProjectErrorResult(nil, "", detRes, err), nil
 		}
 		resolvedProject, _ := store.NormalizeProject(detRes.Project)
 		storedProject := ""
@@ -2258,6 +2263,9 @@ func handleGetObservation(s *store.Store, cfg MCPConfig, activities ...*SessionA
 		// this ID-based lookup.
 		projectOverride, _ := req.GetArguments()["project"].(string)
 		detRes, detErr := resolveReadProjectWithProcessOverride(s, projectOverride, cfg.DefaultProject)
+		// Get-by-ID is anchored on the record identity: when cwd resolution fails
+		// only because the directory is ambiguous, fall back to the stored project.
+		detRes, detErr = storedProjectFallback(obs, detRes, detErr)
 
 		obsProject := ""
 		if obs.Project != nil {
@@ -2799,6 +2807,26 @@ func processProjectResult(defaultProject string) (projectpkg.DetectionResult, bo
 
 func resolveWriteProjectWithProcessOverride(s *store.Store, defaultProject string, requireKnownProcess bool) (projectpkg.DetectionResult, error) {
 	return resolveMCPProjectWithPolicy(s, "", defaultProject, requireKnownProcess)
+}
+
+// storedProjectFallback anchors resolution on the observation's own project
+// when cwd resolution fails only because the current directory is ambiguous
+// (ErrAmbiguousProject). ID-anchored tools (mem_get_observation, mem_update)
+// are safe to proceed with the stored project: the integer id fully identifies
+// the record, and it also carries the owning project. Non-ambiguous errors and
+// observations without a stored project keep the caller's original error path.
+func storedProjectFallback(obs *store.Observation, detRes projectpkg.DetectionResult, detErr error) (projectpkg.DetectionResult, error) {
+	if !errors.Is(detErr, projectpkg.ErrAmbiguousProject) || obs == nil || obs.Project == nil {
+		return detRes, detErr
+	}
+	if strings.TrimSpace(*obs.Project) == "" {
+		return detRes, detErr
+	}
+	detRes.Project = *obs.Project
+	detRes.Source = projectpkg.SourceStoredProject
+	detRes.Path = ""
+	detRes.Error = nil
+	return detRes, nil
 }
 
 type ambiguousRecoveryTokenValidator func(projectpkg.DetectionResult, string) (provided bool, valid bool)
