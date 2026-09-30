@@ -15,7 +15,7 @@ const INSTANCE_ID = "00000000000000000000000000000000"
 let runtimeImport = 0
 
 function httpResponse(data, status = 200) {
-  return { ok: status >= 200 && status < 300, status, async json() { return data } }
+  return { ok: status >= 200 && status < 300, status, async text() { return JSON.stringify(data) }, async json() { return data } }
 }
 
 // Minimal OpenCode V2 event stream. emit() resolves once the plugin asks for
@@ -155,6 +155,7 @@ async function setupV2(t, { sessions = new Map(), promptResponse, registrationRe
     if (path === "/sessions") return registrationResponse ? registrationResponse(body) : httpResponse({ id: body.id, status: "created" })
     if (path === "/context/compaction") return httpResponse({ context: "previous session context" })
     if (path === "/prompts" && promptResponse) return promptResponse(body)
+    if (path.endsWith("/end")) return httpResponse({ id: decodeURIComponent(path.split("/")[2]), status: "completed" })
     return httpResponse({})
   }
 
@@ -217,6 +218,62 @@ async function setupV2(t, { sessions = new Map(), promptResponse, registrationRe
   }
 }
 
+for (const content of ["original", [{ type: "file", uri: "file://fixture", mime: "text/plain" }, { type: "text", text: "original" }]]) {
+  test("V2 degraded warning preserves completed content and pending unknown results", async (t) => {
+    const runtime = await setupV2(t, { sessions: new Map([["root", sessionInfo("root")]]),
+      registrationResponse: () => ({ ok: true, status: 200, async text() { return "{broken" } }) })
+    const after = runtime.hooks.get("tool.execute.after")
+    const unknown = { tool: "read", sessionID: "root", status: "completed", result: { content: 42 } }
+    await after(unknown)
+    assert.equal(unknown.result.content, 42)
+    const error = { tool: "read", sessionID: "root", status: "error", result: { content: "error" } }
+    await after(error)
+    assert.equal(error.result.content, "error")
+    const original = { content, metadata: { keep: true }, output: { keep: "output" } }
+    const call = { tool: "read", sessionID: "root", status: "completed", result: original }
+    await after(call)
+    assert.notStrictEqual(call.result, original)
+    assert.deepEqual(call.result.metadata, original.metadata)
+    assert.strictEqual(call.result.output, original.output)
+    if (typeof content === "string") assert.match(call.result.content, /original[\s\S]*Engram degraded/)
+    else {
+      assert.deepEqual(call.result.content.slice(0, -1), content)
+      assert.match(call.result.content.at(-1).text, /Engram degraded/)
+    }
+    await runtime.cleanup()
+  })
+}
+
+test("V2 failed tool lifecycle registers and renews without consuming pending warnings", async (t) => {
+  const runtime = await setupV2(t, {
+    sessions: new Map([["root", sessionInfo("root")]]),
+    registrationResponse: (body) => httpResponse({ id: body.id === "root" ? "root:resume:2" : body.id, status: "created" }),
+    promptResponse: () => httpResponse({}, 503),
+  })
+  t.after(() => runtime.cleanup())
+  const after = runtime.hooks.get("tool.execute.after")
+  const result = { content: "unchanged error", metadata: { keep: true } }
+  const error = { tool: "subagent", sessionID: "root", status: "error", result, error: new Error("failed") }
+  await after(error)
+  assert.deepEqual(runtime.sessionGetIDs, ["root"])
+  assert.equal(runtime.posts("/sessions").length, 1)
+  assert.equal(runtime.posts("/sessions")[0].body.resume, true)
+  assert.strictEqual(error.result, result)
+  assert.equal(runtime.posts("/observations/passive").length, 0)
+  await runtime.enqueued("root", "warning", { type: "user", payload: { text: "Generate a pending transport warning" } })
+  await runtime.deleted("root")
+  await after(error)
+  assert.equal(runtime.posts("/sessions").length, 2, "failed tools renew ended sessions")
+  assert.strictEqual(error.result, result)
+  assert.equal(error.result.content, "unchanged error")
+  const success = { tool: "read", sessionID: "root", status: "completed", result: { content: "success" } }
+  await after(success)
+  assert.match(success.result.content, /success[\s\S]*Engram degraded/)
+  const next = { tool: "read", sessionID: "root", status: "completed", result: { content: "next" } }
+  await after(next)
+  assert.equal(next.result.content, "next")
+})
+
 function sessionInfo(id, parentID) {
   return { id, projectID: PROJECT_ID, ...(parentID ? { parentID } : {}) }
 }
@@ -273,6 +330,62 @@ test("V2 session.created binds root sessions but never child sessions", async (t
 
   await runtime.deleted("ses_root")
   assert.equal(runtime.posts("/sessions/ses_root/end").length, 1)
+})
+
+test("V2 session.updated closes a late-attributed child exactly once", async (t) => {
+  const runtime = await setupV2(t)
+  t.after(() => runtime.cleanup())
+  await runtime.created("ses_child")
+  assert.equal(runtime.posts("/sessions").length, 1)
+
+  const update = {
+    type: "session.updated",
+    data: { sessionID: "ses_child", parentID: "ses_root", projectID: PROJECT_ID },
+  }
+  await runtime.events.emit(update)
+  assert.equal(runtime.posts("/sessions/ses_child/end").length, 1)
+  await runtime.events.emit(update)
+  await runtime.created("ses_child", "ses_root")
+  await runtime.enqueued("ses_child", "child-inbox", userItem("A delegated prompt must remain excluded"))
+  await runtime.deleted("ses_child")
+  await runtime.cleanup()
+  assert.equal(runtime.posts("/sessions/ses_child/end").length, 1)
+  assert.equal(runtime.posts("/sessions").length, 1)
+  assert.equal(runtime.posts("/prompts").length, 0)
+})
+
+test("V2 root updates do not register duplicates or unknown roots", async (t) => {
+  const runtime = await setupV2(t)
+  t.after(() => runtime.cleanup())
+  await runtime.created("ses_root")
+  for (const sessionID of ["ses_root", "ses_root", "ses_unknown"]) {
+    await runtime.events.emit({ type: "session.updated", data: { sessionID, projectID: PROJECT_ID } })
+  }
+  assert.deepEqual(runtime.posts("/sessions").map(({ body }) => body.id), ["ses_root"])
+  assert.equal(runtime.requests.filter(({ path }) => path.endsWith("/end")).length, 0)
+})
+
+test("V2 ignores malformed and foreign session updates without closing roots", async (t) => {
+  const runtime = await setupV2(t)
+  t.after(() => runtime.cleanup())
+  await runtime.created("ses_root")
+  for (const data of [
+    undefined,
+    {},
+    { sessionID: 42, parentID: "parent", projectID: PROJECT_ID },
+    { sessionID: "", parentID: "parent", projectID: PROJECT_ID },
+    { sessionID: "ses_root", parentID: 42, projectID: PROJECT_ID },
+    { sessionID: "ses_root", parentID: "parent" },
+    { sessionID: "ses_root", parentID: "parent", projectID: "other-project" },
+    { sessionID: "ses_root", parentID: "parent", projectID: PROJECT_ID, location: { directory: "/work/other" } },
+    { sessionID: "ses_unknown", parentID: "parent", projectID: PROJECT_ID },
+  ]) {
+    await runtime.events.emit({ type: "session.updated", data })
+  }
+  assert.equal(runtime.posts("/sessions").length, 1)
+  assert.equal(runtime.requests.filter(({ path }) => path.endsWith("/end")).length, 0)
+  await runtime.events.emit({ type: "session.updated", data: { sessionID: "ses_root", parentID: "parent", projectID: PROJECT_ID } })
+  assert.equal(runtime.posts("/sessions/ses_root/end").length, 1, "valid updates still work after malformed events")
 })
 
 test("V2 ignores other locations and leaves unrelated tool input untouched", async (t) => {

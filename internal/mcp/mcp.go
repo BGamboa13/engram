@@ -35,7 +35,7 @@ import (
 )
 
 const (
-	sourceProcessOverride         = projectpkg.SourceProcessOverride
+	sourceProcessOverride        = projectpkg.SourceProcessOverride
 	sessionIDPropertyDescription = "Optional authoritative session ID already registered by the runtime or mem_session_start; never invent one. Omit by default; ambiguity fails closed."
 )
 
@@ -560,6 +560,7 @@ Examples:
 					mcp.Required(),
 					mcp.Description("Observation ID to update"),
 				),
+				mcp.WithString("expected_project", mcp.Required(), mcp.Description("Explicit expected owner; does not bypass current-project checks")),
 				mcp.WithString("title",
 					mcp.Description("New title"),
 				),
@@ -647,6 +648,7 @@ Examples:
 					mcp.Required(),
 					mcp.Description("Observation ID to delete"),
 				),
+				mcp.WithString("expected_project", mcp.Required(), mcp.Description("Explicit expected owner of the observation")),
 				mcp.WithBoolean("hard_delete",
 					mcp.Description("If true, permanently deletes the observation"),
 				),
@@ -1657,6 +1659,10 @@ func handleSuggestTopicKey() server.ToolHandlerFunc {
 
 func handleUpdate(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		expected, _ := req.GetArguments()["expected_project"].(string)
+		if _, err := store.ValidateExpectedProject(expected); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		id := int64(intArg(req, "id", 0))
 		if id == 0 {
 			return mcp.NewToolResultError("id is required"), nil
@@ -1689,13 +1695,14 @@ func handleUpdate(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 			return mcp.NewToolResultError("provide at least one field to update"), nil
 		}
 
-		detRes, err := resolveWriteProjectWithProcessOverride(s, cfg.DefaultProject, true)
-		if err != nil {
-			return writeProjectErrorResult(nil, "", detRes, err), nil
-		}
 		obs, err := s.GetObservation(id)
 		if err != nil {
 			return mcp.NewToolResultError("Failed to update memory: " + err.Error()), nil
+		}
+
+		detRes, err := resolveWriteProjectWithProcessOverride(s, cfg.DefaultProject, true)
+		if err != nil {
+			return writeProjectErrorResult(nil, "", detRes, err), nil
 		}
 		resolvedProject, _ := store.NormalizeProject(detRes.Project)
 		storedProject := ""
@@ -1721,7 +1728,7 @@ func handleUpdate(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 			truncation = &metadata
 		}
 
-		obs, err = s.UpdateObservation(id, update)
+		obs, err = s.UpdateObservationForProject(id, expected, update)
 		if err != nil {
 			return mcp.NewToolResultError("Failed to update memory: " + err.Error()), nil
 		}
@@ -1846,13 +1853,17 @@ func handleReview(s *store.Store, cfg MCPConfig, activities ...*SessionActivity)
 
 func handleDelete(s *store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		expected, _ := req.GetArguments()["expected_project"].(string)
+		if _, err := store.ValidateExpectedProject(expected); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		id := int64(intArg(req, "id", 0))
 		if id == 0 {
 			return mcp.NewToolResultError("id is required"), nil
 		}
 
 		hardDelete := boolArg(req, "hard_delete", false)
-		if err := s.DeleteObservation(id, hardDelete); err != nil {
+		if err := s.DeleteObservationForProject(id, expected, hardDelete); err != nil {
 			return mcp.NewToolResultError("Failed to delete memory: " + err.Error()), nil
 		}
 
@@ -2258,6 +2269,9 @@ func handleGetObservation(s *store.Store, cfg MCPConfig, activities ...*SessionA
 		// this ID-based lookup.
 		projectOverride, _ := req.GetArguments()["project"].(string)
 		detRes, detErr := resolveReadProjectWithProcessOverride(s, projectOverride, cfg.DefaultProject)
+		// Get-by-ID is anchored on the record identity: when cwd resolution fails
+		// only because the directory is ambiguous, fall back to the stored project.
+		detRes, detErr = storedProjectFallback(obs, detRes, detErr)
 
 		obsProject := ""
 		if obs.Project != nil {
@@ -2799,6 +2813,26 @@ func processProjectResult(defaultProject string) (projectpkg.DetectionResult, bo
 
 func resolveWriteProjectWithProcessOverride(s *store.Store, defaultProject string, requireKnownProcess bool) (projectpkg.DetectionResult, error) {
 	return resolveMCPProjectWithPolicy(s, "", defaultProject, requireKnownProcess)
+}
+
+// storedProjectFallback anchors resolution on the observation's own project
+// when cwd resolution fails only because the current directory is ambiguous
+// (ErrAmbiguousProject). Only the read-only mem_get_observation uses this
+// fallback; mutations must preserve independent caller context and ownership
+// assertions. Non-ambiguous errors and
+// observations without a stored project keep the caller's original error path.
+func storedProjectFallback(obs *store.Observation, detRes projectpkg.DetectionResult, detErr error) (projectpkg.DetectionResult, error) {
+	if !errors.Is(detErr, projectpkg.ErrAmbiguousProject) || obs == nil || obs.Project == nil {
+		return detRes, detErr
+	}
+	if strings.TrimSpace(*obs.Project) == "" {
+		return detRes, detErr
+	}
+	detRes.Project = *obs.Project
+	detRes.Source = projectpkg.SourceStoredProject
+	detRes.Path = ""
+	detRes.Error = nil
+	return detRes, nil
 }
 
 type ambiguousRecoveryTokenValidator func(projectpkg.DetectionResult, string) (provided bool, valid bool)
