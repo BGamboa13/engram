@@ -2522,6 +2522,93 @@ test("shutdown waits for resumed registration and rejects attributed writes", as
   }
 });
 
+test("fallback from ended mapping to live root supersedes identity for writes and cleanup", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalUrl = process.env.ENGRAM_URL;
+  process.env.ENGRAM_URL = "http://127.0.0.1:17437";
+  try {
+    for (const mode of ["shutdown", "explicit", "readonly"]) {
+      const runtimeID = `fallback-${mode}`;
+      const legacyID = `${runtimeID}:resume:legacy-uuid`;
+      const entries = [{ type: "custom", customType: "engram-effective-session", data: { runtimeID, effectiveID: legacyID, project: "pi", pending: true } }];
+      const calls = [];
+      globalThis.fetch = async (url, init = {}) => {
+        const path = new URL(url).pathname;
+        const body = init.body ? JSON.parse(init.body) : undefined;
+        calls.push({ path, body });
+        if (path === "/project/current") return new Response(JSON.stringify({ project: "pi" }));
+        if (path === "/sessions") return body.id === legacyID
+          ? new Response(JSON.stringify({ code: "session_already_ended", session_id: legacyID }), { status: 409 })
+          : new Response(JSON.stringify({ id: runtimeID, status: "created" }));
+        return new Response(JSON.stringify({ id: 1, status: "ended" }));
+      };
+      await withPluginSandbox("engram-pi-fallback-root-", async ({ sandbox }) => {
+        const append = mode === "readonly" ? undefined : (customType, data) => entries.push({ type: "custom", customType, data });
+        const { registeredTools, eventHandlers } = await loadPluginHarness(sandbox, append);
+        const ctx = runtimeContext(runtimeID);
+        ctx.sessionManager.getBranch = () => entries;
+        const saved = await registeredTools.get("mem_save").execute("save", { title: "root", content: "root" }, undefined, undefined, ctx);
+        if (mode === "readonly") {
+          assert.equal(saved.isError, true, "changed root mapping cannot be adopted without append support");
+          assert.match(saved.content[0].text, /Cannot persist/);
+          assert.equal(calls.filter(({ path }) => path === "/observations").length, 0);
+          assert.equal(entries.length, 1);
+          return;
+        }
+        assert.equal(saved.isError, undefined, JSON.stringify(saved));
+        assert.equal(calls.find(({ path }) => path === "/observations").body.session_id, runtimeID);
+        assert.equal(entries.at(-1).data.effectiveID, runtimeID, "root acknowledgement supersedes ended mapping");
+        if (mode === "explicit") {
+          const ended = await registeredTools.get("mem_session_end").execute("end", { id: runtimeID }, undefined, undefined, ctx);
+          assert.equal(ended.isError, undefined, JSON.stringify(ended));
+        }
+        await eventHandlers.get("session_shutdown")({}, ctx);
+        await eventHandlers.get("session_shutdown")({}, ctx);
+        assert.deepEqual(calls.filter(({ path }) => path.endsWith("/end")).map(({ path }) => path), [`/sessions/${runtimeID}/end`]);
+      });
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalUrl === undefined) delete process.env.ENGRAM_URL; else process.env.ENGRAM_URL = originalUrl;
+  }
+});
+
+test("read-only legacy shutdown suppresses confirmed delivery but retries uncertain delivery", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalUrl = process.env.ENGRAM_URL;
+  process.env.ENGRAM_URL = "http://127.0.0.1:17437";
+  try {
+    for (const uncertain of [false, true]) {
+      const runtimeID = `readonly-shutdown-${uncertain}`;
+      const effectiveID = `${runtimeID}:resume:legacy-uuid`;
+      const entries = [{ type: "custom", customType: "engram-effective-session", data: { runtimeID, effectiveID, project: "pi", pending: true } }];
+      let ends = 0;
+      globalThis.fetch = async (url, init = {}) => {
+        const path = new URL(url).pathname;
+        if (path === "/project/current") return new Response(JSON.stringify({ project: "pi" }));
+        if (path === "/sessions") return new Response(JSON.stringify({ id: JSON.parse(init.body).id, status: "created" }));
+        if (path.endsWith("/end")) {
+          ends++;
+          if (uncertain && ends === 1) throw new Error("end acknowledgement lost");
+        }
+        return new Response(JSON.stringify({ status: "ended", id: 1 }));
+      };
+      await withPluginSandbox("engram-pi-readonly-shutdown-", async ({ sandbox }) => {
+        const { registeredTools, eventHandlers } = await loadPluginHarness(sandbox);
+        const ctx = runtimeContext(runtimeID);
+        ctx.sessionManager.getBranch = () => entries;
+        assert.equal((await registeredTools.get("mem_save").execute("save", { title: "legacy", content: "legacy" }, undefined, undefined, ctx)).isError, undefined);
+        for (let index = 0; index < 3; index++) await eventHandlers.get("session_shutdown")({}, ctx);
+        assert.equal(ends, uncertain ? 2 : 1);
+        assert.equal(entries.at(-1).data.pending, true, "read-only log cannot clear its marker");
+      });
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalUrl === undefined) delete process.env.ENGRAM_URL; else process.env.ENGRAM_URL = originalUrl;
+  }
+});
+
 test("hosts without mapping persistence never request core resume", async () => {
   const originalFetch = globalThis.fetch;
   const originalUrl = process.env.ENGRAM_URL;

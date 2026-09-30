@@ -972,7 +972,7 @@ const shutdownFlightsKey = Symbol.for("engram.pi.shutdown-flights");
 const realm = globalThis as typeof globalThis & { [shutdownFlightsKey]?: WeakMap<object, Map<string, Promise<void>>> };
 const shutdownFlights = realm[shutdownFlightsKey] ??= new WeakMap<object, Map<string, Promise<void>>>();
 const lifecycleKey = Symbol.for("engram.pi.session-lifecycle");
-type Lifecycle = { epoch: number; closing: boolean };
+type Lifecycle = { epoch: number; closing: boolean; confirmedShutdownID?: string };
 const lifecycleRealm = globalThis as typeof globalThis & { [lifecycleKey]?: WeakMap<object, Map<string, Lifecycle>> };
 const lifecycles = lifecycleRealm[lifecycleKey] ??= new WeakMap<object, Map<string, Lifecycle>>();
 function lifecycle(ctx: SessionContext, id: string): Lifecycle {
@@ -1101,17 +1101,18 @@ async function registerEffectiveSession(ctx: SessionContext, sessionProject: str
           || !(effectiveID === runtimeID || effectiveID.startsWith(`${runtimeID}:resume:`))) {
           throw new Error(`gentle-engram could not confirm session registration for Pi runtime session ${runtimeID}: invalid acknowledgement`);
         }
-        if (effectiveID !== persistedID && effectiveID !== runtimeID && !canPersist) {
+        if (effectiveID !== persistedID && !canPersist) {
           throw new Error("Cannot persist the acknowledged resumed Pi session identity");
         }
         registeredSessionProjects.set(effectiveID, sessionProject);
         knownSessions.add(`${sessionProject}:${effectiveID}`);
+        state.confirmedShutdownID = undefined;
         // This marker tracks cleanup delivery, not a client-selected reservation.
         // Read again after acknowledgement so a peer graph's synchronous append is visible.
         const alreadyPersisted = effectiveSessionID(ctx, runtimeID) === effectiveID
           && pendingEffectiveSession(ctx, runtimeID, effectiveID)
           && pendingEffectiveSessionProject(ctx, runtimeID, effectiveID) === sessionProject;
-        if (effectiveID !== runtimeID && appendEntry && !alreadyPersisted) appendEntry(EFFECTIVE_SESSION_ENTRY, {
+        if ((effectiveID !== runtimeID || persistedID !== runtimeID) && appendEntry && !alreadyPersisted) appendEntry(EFFECTIVE_SESSION_ENTRY, {
           runtimeID, effectiveID, pending: true, project: sessionProject,
         });
         assertOpen(state, epoch);
@@ -1912,7 +1913,8 @@ export default function registerEngram(pi: ExtensionAPI) {
         && !!owner && (owner === localOwner || owner === (detected || (project !== "unknown" ? project : undefined)));
       // A foreign graph may observe a reservation but never owns its shutdown;
       // still fall through to the common module-local cleanup below.
-      if (!(pendingEffectiveSession(ctx, runtimeID, sessionId) && !persistedPending)
+      if (state.confirmedShutdownID !== sessionId
+        && !(pendingEffectiveSession(ctx, runtimeID, sessionId) && !persistedPending)
         && (persistedPending || hasKnownSession(sessionId) || hasSessionRegistrationInFlight(sessionId))) {
         await sharedShutdown(ctx.sessionManager, sessionId, async () => {
           const ended = await endRegisteredSessionOnce(sessionId, () => bestEffortEngramFetch(
@@ -1920,8 +1922,11 @@ export default function registerEngram(pi: ExtensionAPI) {
             { method: "POST", body: { summary: "" } },
             ctx,
           ), persistedPending);
-          if (persistedPending && ended !== null && ended !== undefined) {
-            pi.appendEntry?.(EFFECTIVE_SESSION_ENTRY, {
+          if (ended !== null && ended !== undefined) {
+            // Read-only session logs cannot clear pending; remember only confirmed delivery.
+            // Renewal resets this marker, and uncertain delivery remains retryable.
+            state.confirmedShutdownID = sessionId;
+            if (persistedPending) pi.appendEntry?.(EFFECTIVE_SESSION_ENTRY, {
               runtimeID, effectiveID: sessionId, pending: false, project: owner,
             });
           }
