@@ -46,7 +46,14 @@ const isServe = process.argv[2] === "serve" || isSyntheticServe;
 if (isServe) {
   appendFileSync(${JSON.stringify(spawnLog)}, "serve\\n");
   ${exitCode === undefined
-      ? `const server = createServer((req, res) => {
+      ? `const server = createServer(async (req, res) => {
+  if (req.url === "/sessions") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    res.writeHead(201, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: JSON.parse(body).id, status: "created" }));
+    return;
+  }
   if (req.url.startsWith("/project/current")) {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ project: "fake-project" }));
@@ -123,8 +130,15 @@ async function withFixture(options, run) {
     const spawnLog = join(dir, "spawns.log");
     await writeFile(spawnLog, "", "utf8");
     const port = await freePort();
-    readyServer = options.readyServer && createHTTPServer((request, response) => {
+    readyServer = options.readyServer && createHTTPServer(async (request, response) => {
       options.requests?.push({ method: request.method, url: request.url });
+      if (request.url === "/sessions") {
+        let body = "";
+        for await (const chunk of request) body += chunk;
+        response.writeHead(201, { "content-type": "application/json" });
+        response.end(JSON.stringify({ id: JSON.parse(body).id, status: "created" }));
+        return;
+      }
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(request.url.startsWith("/project/current") ? { project: "fake-project" } : (options.healthBody ?? { instance_id: "00000000000000000000000000000000" })));
     });

@@ -7,7 +7,6 @@
  */
 
 import { spawn, spawnSync, type ChildProcess, type SpawnSyncReturns } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -957,7 +956,7 @@ let runtimeSessionIdentityAmbiguous = false;
 
 const knownSessions = new Set<string>();
 const registeredSessionProjects = new Map<string, string>();
-const sessionRegistrationsInFlight = new Map<string, Promise<void>>();
+const sessionRegistrationsInFlight = new Map<string, Promise<unknown>>();
 const sessionRegistrationProjects = new Map<string, string>();
 const sessionEndingsInFlight = new Map<string, Promise<unknown>>();
 // Module graphs loaded by the same Pi realm share only active shutdown deliveries.
@@ -1017,7 +1016,6 @@ function warnSessionProjectConflictOnce(error: unknown): void {
 const EFFECTIVE_SESSION_ENTRY = "engram-effective-session";
 const REJECTED_SESSION_ENTRY = "engram-rejected-effective-session";
 const effectiveSessionRegistrations = new Map<string, Promise<string>>();
-const submittedEffectiveSessions = new Set<string>();
 
 function pendingEffectiveSession(ctx: SessionContext, runtimeID: string, effectiveID: string): boolean {
   const branch = ctx.sessionManager.getBranch?.() || [];
@@ -1069,55 +1067,64 @@ async function registerEffectiveSession(ctx: SessionContext, sessionProject: str
     return effectiveID;
   }
   const registration = (async () => {
-    const effectiveID = effectiveSessionID(ctx, runtimeID);
+    const persistedID = effectiveSessionID(ctx, runtimeID);
+    if (pendingEffectiveSession(ctx, runtimeID, persistedID)) {
+      const owner = pendingEffectiveSessionProject(ctx, runtimeID, persistedID);
+      if (!owner) throw new Error(`Cannot confirm project ownership for pending Pi session ${persistedID}`);
+      if (owner !== sessionProject) throw new SessionProjectConflictError(persistedID, owner, sessionProject);
+    }
+    const register = async (id: string, resume: boolean): Promise<string> => {
+      const conflict = sessionProjectConflict(id, sessionProject);
+      if (conflict) throw conflict;
+      const key = `${sessionProject}:${id}`;
+      sessionRegistrationProjects.set(id, sessionProject);
+      const delivery = (async () => {
+        let acknowledgement: { id?: unknown; status?: unknown } | null;
+        try {
+          acknowledgement = await fetch("/sessions", { method: "POST", body: {
+            id, project: sessionProject, directory, ownership_mode: "project_owned", resume,
+          } });
+        } catch (error) {
+          throw sessionProjectConflictFromResponse(error, id, sessionProject) || error;
+        }
+        const effectiveID = acknowledgement?.id;
+        if (acknowledgement?.status !== "created" || typeof effectiveID !== "string"
+          || !(effectiveID === runtimeID || effectiveID.startsWith(`${runtimeID}:resume:`) || effectiveID === persistedID)) {
+          throw new Error(`gentle-engram could not confirm session registration for Pi runtime session ${runtimeID}: invalid acknowledgement`);
+        }
+        if (effectiveID !== runtimeID && (!appendEntry || !ctx.sessionManager.getBranch)) {
+          throw new Error("Cannot persist the acknowledged resumed Pi session identity");
+        }
+        registeredSessionProjects.set(effectiveID, sessionProject);
+        knownSessions.add(`${sessionProject}:${effectiveID}`);
+        // This marker tracks cleanup delivery, not a client-selected reservation.
+        if (effectiveID !== runtimeID && appendEntry) appendEntry(EFFECTIVE_SESSION_ENTRY, {
+          runtimeID, effectiveID, pending: true, project: sessionProject,
+        });
+        assertOpen(state, epoch);
+        return effectiveID;
+      })();
+      sessionRegistrationsInFlight.set(key, delivery);
+      try { return await delivery; }
+      finally {
+        if (sessionRegistrationsInFlight.get(key) === delivery) {
+          sessionRegistrationsInFlight.delete(key);
+          if (!registeredSessionProjects.has(id)) sessionRegistrationProjects.delete(id);
+        }
+      }
+    };
     try {
-      if (pendingEffectiveSession(ctx, runtimeID, effectiveID)) {
-        const pendingProject = pendingEffectiveSessionProject(ctx, runtimeID, effectiveID);
-        if (!pendingProject) throw new Error(`Cannot confirm project ownership for pending Pi session ${effectiveID}`);
-        if (pendingProject !== sessionProject) {
-          throw new SessionProjectConflictError(effectiveID, pendingProject, sessionProject);
-        }
-      }
-      await ensureSession(effectiveID, sessionProject, fetch, true);
-      assertOpen(state, epoch);
-      return effectiveID;
+      // Re-register legacy UUID mappings as-is; never resume a continuation as a new root.
+      return await register(persistedID, persistedID === runtimeID);
     } catch (error) {
-      if (error instanceof SessionProjectConflictError && effectiveID !== runtimeID && appendEntry
-        && error.ownerProject !== pendingEffectiveSessionProject(ctx, runtimeID, effectiveID)) {
-        appendEntry(REJECTED_SESSION_ENTRY, { runtimeID, effectiveID });
-        submittedEffectiveSessions.delete(effectiveID);
+      if (error instanceof SessionProjectConflictError && persistedID !== runtimeID && appendEntry
+        && error.ownerProject !== pendingEffectiveSessionProject(ctx, runtimeID, persistedID)) {
+        appendEntry(REJECTED_SESSION_ENTRY, { runtimeID, effectiveID: persistedID });
       }
-      if (!(error instanceof EngramHttpError) || error.status !== 409
+      if (persistedID === runtimeID || !(error instanceof EngramHttpError) || error.status !== 409
         || (error.data as { code?: string } | null)?.code !== "session_already_ended") throw error;
-      if (!appendEntry || !ctx.sessionManager.getBranch) throw error;
-      // Another module graph may have reserved the replacement while this POST was in flight.
-      // Read the shared branch before reserving: appendEntry is synchronous, so this check
-      // and the reservation below cannot interleave with another caller's continuation.
       assertOpen(state, epoch);
-      const reservedID = effectiveSessionID(ctx, runtimeID);
-      if (reservedID !== effectiveID && pendingEffectiveSession(ctx, runtimeID, reservedID)) {
-        const owner = pendingEffectiveSessionProject(ctx, runtimeID, reservedID);
-        if (!owner) throw new Error(`Cannot confirm project ownership for pending Pi session ${reservedID}`);
-        if (owner !== sessionProject) throw new SessionProjectConflictError(reservedID, owner, sessionProject);
-        await ensureSession(reservedID, sessionProject, fetch, true);
-        assertOpen(state, epoch);
-        return reservedID;
-      }
-      assertOpen(state, epoch);
-      const freshID = `${runtimeID}:resume:${randomUUID()}`;
-      appendEntry(EFFECTIVE_SESSION_ENTRY, { runtimeID, effectiveID: freshID, pending: true, project: sessionProject });
-      submittedEffectiveSessions.add(freshID);
-      try {
-        await ensureSession(freshID, sessionProject, fetch, true);
-        assertOpen(state, epoch);
-      } catch (registrationError) {
-        if (registrationError instanceof SessionProjectConflictError) {
-          appendEntry(REJECTED_SESSION_ENTRY, { runtimeID, effectiveID: freshID });
-          submittedEffectiveSessions.delete(freshID);
-        }
-        throw registrationError;
-      }
-      return freshID;
+      return register(runtimeID, true);
     }
   })();
   effectiveSessionRegistrations.set(registrationKey, registration);
@@ -1138,7 +1145,7 @@ async function ensureSession(sessionId: string, sessionProject = project, fetch:
   if (!renew && knownSessions.has(key)) return;
 
   const existingRegistration = sessionRegistrationsInFlight.get(key);
-  if (existingRegistration) return existingRegistration;
+  if (existingRegistration) { await existingRegistration; return; }
 
   const registration = (async () => {
     const body: SessionBody = { id: sessionId, project: sessionProject, directory, ownership_mode: "project_owned" };
@@ -1253,12 +1260,11 @@ async function endRegisteredSessionOnce(sessionId: string, end: () => Promise<un
     if (requireConfirmedRegistration && !registeredSessionProjects.has(sessionId)) {
       throw new Error(`Cannot end Pi session ${sessionId} without confirmed local project ownership`);
     }
-    if (!registrationWasInFlight && !hasKnownSession(sessionId) && !submittedEffectiveSessions.has(sessionId) && !persistedPending) return null;
+    if (!registrationWasInFlight && !hasKnownSession(sessionId) && !persistedPending) return null;
     try {
       return await end();
     } finally {
       forgetKnownSession(sessionId);
-      submittedEffectiveSessions.delete(sessionId);
     }
   })();
   sessionEndingsInFlight.set(sessionId, ending);
