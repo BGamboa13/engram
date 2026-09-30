@@ -7,7 +7,6 @@
  */
 
 import { spawn, spawnSync, type ChildProcess, type SpawnSyncReturns } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -261,18 +260,19 @@ class SessionProjectConflictError extends Error {
   }
 }
 
-function sessionProjectConflictFromResponse(error: unknown, sessionId: string, requestedProject: string): SessionProjectConflictError | undefined {
+function sessionProjectConflictFromResponse(error: unknown, sessionId: string, requestedProject: string, resumeRoot?: string): SessionProjectConflictError | undefined {
   if (!(error instanceof EngramHttpError) || error.status !== 409 || !error.data || typeof error.data !== "object") return undefined;
   const data = error.data as Record<string, unknown>;
   const ownerProject = typeof data.owner_project === "string" ? data.owner_project : "";
   if (
     data.code !== "session_project_conflict"
-    || data.session_id !== sessionId
+    || !(data.session_id === sessionId || (resumeRoot !== undefined
+      && typeof data.session_id === "string" && data.session_id.startsWith(`${resumeRoot}:resume:`)))
     || data.requested_project !== requestedProject
     || ownerProject.length === 0
     || ownerProject === requestedProject
   ) return undefined;
-  return new SessionProjectConflictError(sessionId, ownerProject, requestedProject);
+  return new SessionProjectConflictError(data.session_id as string, ownerProject, requestedProject);
 }
 
 // Node rejects an AbortSignal.timeout() fetch with a DOMException named "TimeoutError",
@@ -963,7 +963,7 @@ let runtimeSessionIdentityAmbiguous = false;
 
 const knownSessions = new Set<string>();
 const registeredSessionProjects = new Map<string, string>();
-const sessionRegistrationsInFlight = new Map<string, Promise<void>>();
+const sessionRegistrationsInFlight = new Map<string, Promise<unknown>>();
 const sessionRegistrationProjects = new Map<string, string>();
 const sessionEndingsInFlight = new Map<string, Promise<unknown>>();
 // Module graphs loaded by the same Pi realm share only active shutdown deliveries.
@@ -972,7 +972,7 @@ const shutdownFlightsKey = Symbol.for("engram.pi.shutdown-flights");
 const realm = globalThis as typeof globalThis & { [shutdownFlightsKey]?: WeakMap<object, Map<string, Promise<void>>> };
 const shutdownFlights = realm[shutdownFlightsKey] ??= new WeakMap<object, Map<string, Promise<void>>>();
 const lifecycleKey = Symbol.for("engram.pi.session-lifecycle");
-type Lifecycle = { epoch: number; closing: boolean };
+type Lifecycle = { epoch: number; closing: boolean; confirmedShutdownID?: string };
 const lifecycleRealm = globalThis as typeof globalThis & { [lifecycleKey]?: WeakMap<object, Map<string, Lifecycle>> };
 const lifecycles = lifecycleRealm[lifecycleKey] ??= new WeakMap<object, Map<string, Lifecycle>>();
 function lifecycle(ctx: SessionContext, id: string): Lifecycle {
@@ -1023,7 +1023,6 @@ function warnSessionProjectConflictOnce(error: unknown, ctx?: SessionContext): v
 const EFFECTIVE_SESSION_ENTRY = "engram-effective-session";
 const REJECTED_SESSION_ENTRY = "engram-rejected-effective-session";
 const effectiveSessionRegistrations = new Map<string, Promise<string>>();
-const submittedEffectiveSessions = new Set<string>();
 
 function pendingEffectiveSession(ctx: SessionContext, runtimeID: string, effectiveID: string): boolean {
   const branch = ctx.sessionManager.getBranch?.() || [];
@@ -1055,7 +1054,8 @@ function effectiveSessionID(ctx: SessionContext, runtimeID: string): string {
     const entry = branch[i];
     if (entry.type !== "custom" || entry.customType !== EFFECTIVE_SESSION_ENTRY) continue;
     const data = entry.data as { runtimeID?: string; effectiveID?: string } | undefined;
-    if (data?.runtimeID === runtimeID && typeof data.effectiveID === "string" && data.effectiveID !== runtimeID) return data.effectiveID;
+    if (data?.runtimeID === runtimeID && typeof data.effectiveID === "string"
+      && (data.effectiveID === runtimeID || data.effectiveID.startsWith(`${runtimeID}:resume:`))) return data.effectiveID;
   }
   return runtimeID;
 }
@@ -1075,55 +1075,70 @@ async function registerEffectiveSession(ctx: SessionContext, sessionProject: str
     return effectiveID;
   }
   const registration = (async () => {
-    const effectiveID = effectiveSessionID(ctx, runtimeID);
+    const persistedID = effectiveSessionID(ctx, runtimeID);
+    const canPersist = !!appendEntry && !!ctx.sessionManager.getBranch;
+    if (pendingEffectiveSession(ctx, runtimeID, persistedID)) {
+      const owner = pendingEffectiveSessionProject(ctx, runtimeID, persistedID);
+      if (!owner) throw new Error(`Cannot confirm project ownership for pending Pi session ${persistedID}`);
+      if (owner !== sessionProject) throw new SessionProjectConflictError(persistedID, owner, sessionProject);
+    }
+    const register = async (id: string, resume: boolean): Promise<string> => {
+      const conflict = sessionProjectConflict(id, sessionProject);
+      if (conflict) throw conflict;
+      const key = `${sessionProject}:${id}`;
+      sessionRegistrationProjects.set(id, sessionProject);
+      const delivery = (async () => {
+        let acknowledgement: { id?: unknown; status?: unknown } | null;
+        try {
+          acknowledgement = await fetch("/sessions", { method: "POST", body: {
+            id, project: sessionProject, directory, ownership_mode: "project_owned", resume,
+          } });
+        } catch (error) {
+          throw sessionProjectConflictFromResponse(error, id, sessionProject, resume ? runtimeID : undefined) || error;
+        }
+        const effectiveID = acknowledgement?.id;
+        if (acknowledgement?.status !== "created" || typeof effectiveID !== "string"
+          || !(effectiveID === runtimeID || effectiveID.startsWith(`${runtimeID}:resume:`))) {
+          throw new Error(`gentle-engram could not confirm session registration for Pi runtime session ${runtimeID}: invalid acknowledgement`);
+        }
+        if (effectiveID !== persistedID && !canPersist) {
+          throw new Error("Cannot persist the acknowledged resumed Pi session identity");
+        }
+        registeredSessionProjects.set(effectiveID, sessionProject);
+        knownSessions.add(`${sessionProject}:${effectiveID}`);
+        state.confirmedShutdownID = undefined;
+        // This marker tracks cleanup delivery, not a client-selected reservation.
+        // Read again after acknowledgement so a peer graph's synchronous append is visible.
+        const alreadyPersisted = effectiveSessionID(ctx, runtimeID) === effectiveID
+          && pendingEffectiveSession(ctx, runtimeID, effectiveID)
+          && pendingEffectiveSessionProject(ctx, runtimeID, effectiveID) === sessionProject;
+        if ((effectiveID !== runtimeID || persistedID !== runtimeID) && appendEntry && !alreadyPersisted) appendEntry(EFFECTIVE_SESSION_ENTRY, {
+          runtimeID, effectiveID, pending: true, project: sessionProject,
+        });
+        assertOpen(state, epoch);
+        return effectiveID;
+      })();
+      sessionRegistrationsInFlight.set(key, delivery);
+      try { return await delivery; }
+      finally {
+        if (sessionRegistrationsInFlight.get(key) === delivery) {
+          sessionRegistrationsInFlight.delete(key);
+          if (!registeredSessionProjects.has(id)) sessionRegistrationProjects.delete(id);
+        }
+      }
+    };
     try {
-      if (pendingEffectiveSession(ctx, runtimeID, effectiveID)) {
-        const pendingProject = pendingEffectiveSessionProject(ctx, runtimeID, effectiveID);
-        if (!pendingProject) throw new Error(`Cannot confirm project ownership for pending Pi session ${effectiveID}`);
-        if (pendingProject !== sessionProject) {
-          throw new SessionProjectConflictError(effectiveID, pendingProject, sessionProject);
-        }
-      }
-      await ensureSession(effectiveID, sessionProject, fetch, true);
-      assertOpen(state, epoch);
-      return effectiveID;
+      // Re-register legacy UUID mappings as-is; never resume a continuation as a new root.
+      return await register(persistedID, canPersist && persistedID === runtimeID);
     } catch (error) {
-      if (error instanceof SessionProjectConflictError && effectiveID !== runtimeID && appendEntry
-        && error.ownerProject !== pendingEffectiveSessionProject(ctx, runtimeID, effectiveID)) {
-        appendEntry(REJECTED_SESSION_ENTRY, { runtimeID, effectiveID });
-        submittedEffectiveSessions.delete(effectiveID);
+      if (error instanceof SessionProjectConflictError && persistedID !== runtimeID && appendEntry
+        && error.ownerProject !== pendingEffectiveSessionProject(ctx, runtimeID, persistedID)) {
+        appendEntry(REJECTED_SESSION_ENTRY, { runtimeID, effectiveID: persistedID });
       }
-      if (!(error instanceof EngramHttpError) || error.status !== 409
+      if (persistedID === runtimeID || !(error instanceof EngramHttpError) || error.status !== 409
         || (error.data as { code?: string } | null)?.code !== "session_already_ended") throw error;
-      if (!appendEntry || !ctx.sessionManager.getBranch) throw error;
-      // Another module graph may have reserved the replacement while this POST was in flight.
-      // Read the shared branch before reserving: appendEntry is synchronous, so this check
-      // and the reservation below cannot interleave with another caller's continuation.
       assertOpen(state, epoch);
-      const reservedID = effectiveSessionID(ctx, runtimeID);
-      if (reservedID !== effectiveID && pendingEffectiveSession(ctx, runtimeID, reservedID)) {
-        const owner = pendingEffectiveSessionProject(ctx, runtimeID, reservedID);
-        if (!owner) throw new Error(`Cannot confirm project ownership for pending Pi session ${reservedID}`);
-        if (owner !== sessionProject) throw new SessionProjectConflictError(reservedID, owner, sessionProject);
-        await ensureSession(reservedID, sessionProject, fetch, true);
-        assertOpen(state, epoch);
-        return reservedID;
-      }
-      assertOpen(state, epoch);
-      const freshID = `${runtimeID}:resume:${randomUUID()}`;
-      appendEntry(EFFECTIVE_SESSION_ENTRY, { runtimeID, effectiveID: freshID, pending: true, project: sessionProject });
-      submittedEffectiveSessions.add(freshID);
-      try {
-        await ensureSession(freshID, sessionProject, fetch, true);
-        assertOpen(state, epoch);
-      } catch (registrationError) {
-        if (registrationError instanceof SessionProjectConflictError) {
-          appendEntry(REJECTED_SESSION_ENTRY, { runtimeID, effectiveID: freshID });
-          submittedEffectiveSessions.delete(freshID);
-        }
-        throw registrationError;
-      }
-      return freshID;
+      return register(runtimeID, canPersist);
     }
   })();
   effectiveSessionRegistrations.set(registrationKey, registration);
@@ -1144,7 +1159,7 @@ async function ensureSession(sessionId: string, sessionProject = project, fetch:
   if (!renew && knownSessions.has(key)) return;
 
   const existingRegistration = sessionRegistrationsInFlight.get(key);
-  if (existingRegistration) return existingRegistration;
+  if (existingRegistration) { await existingRegistration; return; }
 
   const registration = (async () => {
     const body: SessionBody = { id: sessionId, project: sessionProject, directory, ownership_mode: "project_owned" };
@@ -1259,12 +1274,11 @@ async function endRegisteredSessionOnce(sessionId: string, end: () => Promise<un
     if (requireConfirmedRegistration && !registeredSessionProjects.has(sessionId)) {
       throw new Error(`Cannot end Pi session ${sessionId} without confirmed local project ownership`);
     }
-    if (!registrationWasInFlight && !hasKnownSession(sessionId) && !submittedEffectiveSessions.has(sessionId) && !persistedPending) return null;
+    if (!registrationWasInFlight && !hasKnownSession(sessionId) && !persistedPending) return null;
     try {
       return await end();
     } finally {
       forgetKnownSession(sessionId);
-      submittedEffectiveSessions.delete(sessionId);
     }
   })();
   sessionEndingsInFlight.set(sessionId, ending);
@@ -1493,9 +1507,10 @@ function queryString(params: Record<string, unknown>): string {
   return encoded ? `?${encoded}` : "";
 }
 
-async function archiveCompactionSummary(sessionId: string, summary: string, ctx?: SessionContext): Promise<string> {
+async function archiveCompactionSummary(sessionId: string, summary: string, runtimeID: string, ctx?: SessionContext): Promise<string> {
   try {
-    if (soleActiveRuntimeSessionID() !== sessionId) return ArchiveOutcome.Unavailable;
+    // Ambiguity is checked against Pi's host identity; attribution uses Engram's effective ID.
+    if (soleActiveRuntimeSessionID() !== runtimeID) return ArchiveOutcome.Unavailable;
     const result = await engramFetchResult("/observations", {
       method: "POST",
       body: {
@@ -1653,6 +1668,10 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
       if (typeof params.id !== "string" || !params.id || params.id !== sessionId) {
         throw new Error("Pi-native session end requires the current host session ID; end independent sessions directly outside Pi-native tools");
       }
+      // Registration may select a continuation while this explicit end is waiting.
+      await Promise.all([...effectiveSessionRegistrations.entries()]
+        .filter(([key]) => key.endsWith(`\u0000${sessionId}`))
+        .map(([, registration]) => registration));
       const endedSessionID = effectiveSessionID(ctx, sessionId);
       const persistedPending = pendingEffectiveSession(ctx, sessionId, endedSessionID);
       const owner = persistedPending ? pendingEffectiveSessionProject(ctx, sessionId, endedSessionID) : undefined;
@@ -1894,7 +1913,8 @@ export default function registerEngram(pi: ExtensionAPI) {
         && !!owner && (owner === localOwner || owner === (detected || (project !== "unknown" ? project : undefined)));
       // A foreign graph may observe a reservation but never owns its shutdown;
       // still fall through to the common module-local cleanup below.
-      if (!(pendingEffectiveSession(ctx, runtimeID, sessionId) && !persistedPending)
+      if (state.confirmedShutdownID !== sessionId
+        && !(pendingEffectiveSession(ctx, runtimeID, sessionId) && !persistedPending)
         && (persistedPending || hasKnownSession(sessionId) || hasSessionRegistrationInFlight(sessionId))) {
         await sharedShutdown(ctx.sessionManager, sessionId, async () => {
           const ended = await endRegisteredSessionOnce(sessionId, () => bestEffortEngramFetch(
@@ -1902,8 +1922,11 @@ export default function registerEngram(pi: ExtensionAPI) {
             { method: "POST", body: { summary: "" } },
             ctx,
           ), persistedPending);
-          if (persistedPending && ended !== null && ended !== undefined) {
-            pi.appendEntry?.(EFFECTIVE_SESSION_ENTRY, {
+          if (ended !== null && ended !== undefined) {
+            // Read-only session logs cannot clear pending; remember only confirmed delivery.
+            // Renewal resets this marker, and uncertain delivery remains retryable.
+            state.confirmedShutdownID = sessionId;
+            if (persistedPending) pi.appendEntry?.(EFFECTIVE_SESSION_ENTRY, {
               runtimeID, effectiveID: sessionId, pending: false, project: owner,
             });
           }
@@ -1948,7 +1971,7 @@ export default function registerEngram(pi: ExtensionAPI) {
     if (soleActiveRuntimeSessionID() !== sessionId || knownSessions.has(`\u0000closing:${effectiveID}`)) return;
 
     let outcome: string;
-    try { open(); outcome = await archiveCompactionSummary(effectiveID, summary, observed); }
+    try { open(); outcome = await archiveCompactionSummary(effectiveID, summary, sessionId, observed); }
     catch { outcome = ArchiveOutcome.Unavailable; }
     const context = !knownSessions.has(`\u0000closing:${effectiveID}`) && soleActiveRuntimeSessionID() === sessionId
       ? await loadCompactionRecoveryContext(effectiveID, observed)

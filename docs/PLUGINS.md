@@ -24,6 +24,8 @@
 
 Pi and OpenCode activity renews the local runtime lease through their existing session registration paths. This is local SQLite liveness only: it has no timer, cloud synchronization, or cross-machine coordination.
 
+Pi sends `resume: true` for runtime-root registration and adopts only a valid acknowledged effective ID. The Go core selects numeric continuations; Pi persists the mapping in its session entries for reloads and uses it for attributed writes and shutdown `/end`. Legacy `:resume:<uuid>` mappings are re-registered as-is; an ended mapping falls back to root registration with `resume: true`. Reload does not end the session. Ownership conflicts and an older server's `409 session_already_ended` block writes rather than triggering client-generated identities.
+
 ### Codex on Windows
 - The manifest launches plugin-root `run-native-hook.ps1` through SystemRoot-qualified Windows PowerShell.
 - The adapter reads the setup-owned absolute pin and invokes its native hook command.
