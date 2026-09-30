@@ -1874,7 +1874,7 @@ test("session compaction strictly registers before forwarding its summary", () =
   const compactHandler = source.slice(compactStart, compactEnd);
 
   const registration = compactHandler.indexOf("await registerEffectiveSession(");
-  const summaryPost = compactHandler.indexOf("await archiveCompactionSummary(effectiveID, summary);");
+  const summaryPost = compactHandler.indexOf("await archiveCompactionSummary(effectiveID, summary, sessionId);");
   assert.notEqual(registration, -1, "session_compact must await strict session registration");
   assert.notEqual(summaryPost, -1, "session_compact summary post not found");
   assert.ok(registration < summaryPost, "strict registration must precede summary forwarding");

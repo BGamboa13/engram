@@ -258,18 +258,19 @@ class SessionProjectConflictError extends Error {
   }
 }
 
-function sessionProjectConflictFromResponse(error: unknown, sessionId: string, requestedProject: string): SessionProjectConflictError | undefined {
+function sessionProjectConflictFromResponse(error: unknown, sessionId: string, requestedProject: string, resumeRoot?: string): SessionProjectConflictError | undefined {
   if (!(error instanceof EngramHttpError) || error.status !== 409 || !error.data || typeof error.data !== "object") return undefined;
   const data = error.data as Record<string, unknown>;
   const ownerProject = typeof data.owner_project === "string" ? data.owner_project : "";
   if (
     data.code !== "session_project_conflict"
-    || data.session_id !== sessionId
+    || !(data.session_id === sessionId || (resumeRoot !== undefined
+      && typeof data.session_id === "string" && data.session_id.startsWith(`${resumeRoot}:resume:`)))
     || data.requested_project !== requestedProject
     || ownerProject.length === 0
     || ownerProject === requestedProject
   ) return undefined;
-  return new SessionProjectConflictError(sessionId, ownerProject, requestedProject);
+  return new SessionProjectConflictError(data.session_id as string, ownerProject, requestedProject);
 }
 
 // Node rejects an AbortSignal.timeout() fetch with a DOMException named "TimeoutError",
@@ -1047,7 +1048,8 @@ function effectiveSessionID(ctx: SessionContext, runtimeID: string): string {
     const entry = branch[i];
     if (entry.type !== "custom" || entry.customType !== EFFECTIVE_SESSION_ENTRY) continue;
     const data = entry.data as { runtimeID?: string; effectiveID?: string } | undefined;
-    if (data?.runtimeID === runtimeID && typeof data.effectiveID === "string" && data.effectiveID !== runtimeID) return data.effectiveID;
+    if (data?.runtimeID === runtimeID && typeof data.effectiveID === "string"
+      && (data.effectiveID === runtimeID || data.effectiveID.startsWith(`${runtimeID}:resume:`))) return data.effectiveID;
   }
   return runtimeID;
 }
@@ -1085,11 +1087,11 @@ async function registerEffectiveSession(ctx: SessionContext, sessionProject: str
             id, project: sessionProject, directory, ownership_mode: "project_owned", resume,
           } });
         } catch (error) {
-          throw sessionProjectConflictFromResponse(error, id, sessionProject) || error;
+          throw sessionProjectConflictFromResponse(error, id, sessionProject, resume ? runtimeID : undefined) || error;
         }
         const effectiveID = acknowledgement?.id;
         if (acknowledgement?.status !== "created" || typeof effectiveID !== "string"
-          || !(effectiveID === runtimeID || effectiveID.startsWith(`${runtimeID}:resume:`) || effectiveID === persistedID)) {
+          || !(effectiveID === runtimeID || effectiveID.startsWith(`${runtimeID}:resume:`))) {
           throw new Error(`gentle-engram could not confirm session registration for Pi runtime session ${runtimeID}: invalid acknowledgement`);
         }
         if (effectiveID !== runtimeID && (!appendEntry || !ctx.sessionManager.getBranch)) {
@@ -1491,9 +1493,10 @@ function queryString(params: Record<string, unknown>): string {
   return encoded ? `?${encoded}` : "";
 }
 
-async function archiveCompactionSummary(sessionId: string, summary: string): Promise<string> {
+async function archiveCompactionSummary(sessionId: string, summary: string, runtimeID: string): Promise<string> {
   try {
-    if (soleActiveRuntimeSessionID() !== sessionId) return ArchiveOutcome.Unavailable;
+    // Ambiguity is checked against Pi's host identity; attribution uses Engram's effective ID.
+    if (soleActiveRuntimeSessionID() !== runtimeID) return ArchiveOutcome.Unavailable;
     const result = await engramFetchResult("/observations", {
       method: "POST",
       body: {
@@ -1945,7 +1948,7 @@ export default function registerEngram(pi: ExtensionAPI) {
     if (soleActiveRuntimeSessionID() !== sessionId || knownSessions.has(`\u0000closing:${effectiveID}`)) return;
 
     let outcome: string;
-    try { open(); outcome = await archiveCompactionSummary(effectiveID, summary); }
+    try { open(); outcome = await archiveCompactionSummary(effectiveID, summary, sessionId); }
     catch { outcome = ArchiveOutcome.Unavailable; }
     const context = !knownSessions.has(`\u0000closing:${effectiveID}`) && soleActiveRuntimeSessionID() === sessionId
       ? await loadCompactionRecoveryContext(effectiveID)

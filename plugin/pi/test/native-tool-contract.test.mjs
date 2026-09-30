@@ -403,7 +403,7 @@ test("fresh Pi state honors a structured session-project conflict without captur
         return new Response(JSON.stringify({
           error: "session ownership does not match write project",
           code: "session_project_conflict",
-          session_id: "resumed-runtime-session",
+          session_id: "resumed-runtime-session:resume:2",
           owner_project: "project-a",
           requested_project: "project-b",
         }), { status: 409 });
@@ -1528,6 +1528,12 @@ test("resumed quit adopts core numeric identities and reload retains the persist
       assert.equal(calls.filter((call) => call.path === "/sessions").at(-1).body.resume, true);
       const effectiveID = "resumed:resume:2";
       assert.equal(calls.filter((call) => call.path === "/observations").at(-1).body.session_id, effectiveID);
+      await second.eventHandlers.get("session_compact")({ summary: "resumed compaction summary" });
+      const archive = calls.find((call) => call.path === "/observations" && call.body.type === "session_summary");
+      assert.ok(archive, "resumed compaction must archive its summary");
+      assert.equal(archive.body.session_id, effectiveID);
+      const recovered = await second.eventHandlers.get("before_agent_start")({ systemPrompt: "base" }, ctx);
+      assert.match(recovered.systemPrompt, /already saved/);
       assert.ok(entries.length);
       const third = await loadPluginHarness(sandbox, appendEntry);
       await third.eventHandlers.get("session_start")({ reason: "reload" }, ctx);
@@ -2370,6 +2376,45 @@ test("shutdown waits for resumed registration and rejects attributed writes", as
     globalThis.fetch = originalFetch;
     if (originalUrl === undefined) delete process.env.ENGRAM_URL;
     else process.env.ENGRAM_URL = originalUrl;
+  }
+});
+
+test("malformed persisted mapping never authorizes foreign writes or cleanup", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalUrl = process.env.ENGRAM_URL;
+  process.env.ENGRAM_URL = "http://127.0.0.1:17437";
+  const entries = [{ type: "custom", customType: "engram-effective-session", data: { runtimeID: "root", effectiveID: "foreign", project: "pi", pending: true } }];
+  const ctx = runtimeContext("root");
+  ctx.sessionManager.getBranch = () => entries;
+  const calls = [];
+  let foreignAck = true;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    calls.push({ path, body });
+    if (path === "/project/current") return new Response(JSON.stringify({ project: "pi" }));
+    if (path === "/sessions") return new Response(JSON.stringify({ id: foreignAck ? "foreign" : body.id, status: "created" }));
+    return new Response(JSON.stringify({ id: 1, status: "ok" }));
+  };
+  try {
+    await withPluginSandbox("engram-pi-malformed-mapping-", async ({ sandbox }) => {
+      const { registeredTools, eventHandlers } = await loadPluginHarness(sandbox, (customType, data) => entries.push({ type: "custom", customType, data }));
+      const save = () => registeredTools.get("mem_save").execute("malformed", { title: "blocked", content: "blocked" }, undefined, undefined, ctx);
+      assert.equal((await save()).isError, true, "foreign acknowledgement must be refused even when persisted");
+      assert.equal(calls.filter(({ path }) => path === "/observations").length, 0);
+      await eventHandlers.get("session_shutdown")({}, ctx);
+      assert.equal(calls.filter(({ path }) => path.endsWith("/end")).length, 0);
+      foreignAck = false;
+      await eventHandlers.get("session_start")({}, ctx);
+      assert.equal((await save()).isError, undefined);
+      await eventHandlers.get("session_shutdown")({}, ctx);
+      assert.ok(calls.filter(({ path }) => path === "/sessions").every(({ body }) => body.id === "root" && body.resume === true));
+      assert.deepEqual(calls.filter(({ path }) => path === "/observations").map(({ body }) => body.session_id), ["root"]);
+      assert.deepEqual(calls.filter(({ path }) => path.endsWith("/end")).map(({ path }) => path), ["/sessions/root/end"]);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalUrl === undefined) delete process.env.ENGRAM_URL; else process.env.ENGRAM_URL = originalUrl;
   }
 });
 
