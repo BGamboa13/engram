@@ -824,6 +824,9 @@ function spawnAndWaitForEngram(deadline: number, expectedID = ""): Promise<void>
 
     try {
       proc = spawn(ENGRAM_BIN, ["serve"], {
+        // Opt into cloud autosync like the Claude Code and Codex launchers; the
+        // server skips it on its own when no cloud server or token is configured.
+        env: { ...process.env, ENGRAM_CLOUD_AUTOSYNC: "1" },
         windowsHide: true,
         detached: true,
         stdio: "ignore",
