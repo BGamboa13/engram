@@ -302,12 +302,14 @@ For an accepted `POST /sync/mutations/push`, each future materialized cloud chun
 
 ### Health
 
-- Local runtime (`engram serve`): `GET /health` checks the local store with live aggregate queries. On success it returns `200` with `{"status":"ok","service":"engram","version":"<release version>","instance_id":"<store instance ID>"}`; a failed store returns `500` with `{"error":"health check failed"}` instead of reporting healthy.
+- Local runtime (`engram serve`): `GET /health` checks the local store with live aggregate queries. On success it returns `200` with `{"status":"ok","service":"engram","version":"<release version>","instance_id":"<store instance ID>","capabilities":{"isolated_session_registration":true}}`; a failed store returns `500` with `{"error":"health check failed"}` instead of reporting healthy.
 - Cloud runtime (`engram cloud serve`): `GET /health` — Returns `{"status": "ok", "service": "engram-cloud"}`
 
 ### Sessions
 
-- `POST /sessions` — Create or renew a runtime session. Body: `{id, project, directory, ownership_mode?, resume?}`
+- `POST /sessions` — Create or renew a runtime session. Body: `{id, project, directory?, ownership_mode?, resume?, isolated?}`
+  - `directory` is optional. Ordinary registration normalizes directories to the runtime worktree root, including omitted or blank input resolving to server cwd. Renewal keeps the first nonblank stored directory.
+  - `isolated: true` requires `ownership_mode: "project_owned"` and an omitted or blank directory (otherwise `400`). It stores an empty directory and atomically rejects a nonblank directory on either the requested root or selected continuation with `409 code: "session_isolation_conflict"` before lease renewal, ownership repair, or sync mutations. Existing runtime-bound rows are never silently cleared. This contract is advertised by `GET /health` as `capabilities.isolated_session_registration: true`; clients must require that exact capability before sending isolated registrations, because older servers may ignore the flag.
   - `ownership_mode` accepts `shared` or `project_owned`; when omitted it defaults to `shared`.
   - A successful create or renewal writes a local 30-minute `runtime_lease_expires_at` without changing the persisted session identity. Leases are local liveness evidence only: they are neither synced nor exported.
   - A `project_owned` registration cannot reuse a session with a nonblank persisted project different from its requested project. It returns `409` with `{error, code:"session_project_conflict", session_id, owner_project, requested_project}` and does not mutate the session or local sync journal. Same-project registration remains idempotent; omitted or `shared` registration retains compatibility for shared sessions.
@@ -315,6 +317,7 @@ For an accepted `POST /sync/mutations/push`, each future materialized cloud chun
   - With `resume: true`, a new or live root keeps its ID. For an ended root, the store atomically renews the lowest numeric live `<id>:resume:N` continuation, or creates the next ordinal after the maximum existing numeric suffix (starting at 2, no cap). Non-numeric suffixes and other roots are ignored. The selected continuation follows normal ownership and lease rules; conflicts return `409 session_project_conflict` without advancing further. Concurrent callers converge on one live continuation.
   - Success remains `201` with `{id, status:"created"}`. A continuation response also includes `resumed_from: <root id>` and returns the effective ID in `id`. Use that acknowledged ID for subsequent session-bound operations. MCP session registration does not opt into resume mode.
   - An invalid non-empty `ownership_mode` returns `400` and does not create a session.
+  - Session IDs are opaque non-blank strings. The Pi adapter derives cross-project satellite IDs as `<runtimeID>@<project>` (registered `project_owned` with `resume: true`, `isolated: true`, and no directory). Capability preflight protects against old servers without a guessed version floor. Newly created satellites are never implicit directory-matched runtime candidates; Pi's explicit `cwd` only resolves the target project. This ensures an explicitly targeted write to another project never re-registers the runtime session under a second owner. See [plugin/pi/README.md](plugin/pi/README.md#cross-project-saves).
 - `POST /sessions/{id}/end` — End session. Body: `{summary}`
 - `GET /sessions/recent` — Recent sessions. Query: `?project=X&all_projects=true&limit=N`
   - No-result responses return `200` with `[]` (never `null`)
