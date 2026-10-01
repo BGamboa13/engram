@@ -45,6 +45,7 @@ if (process.argv.includes("sync") || process.argv.includes("--import")) { append
 const isServe = process.argv[2] === "serve" || isSyntheticServe;
 if (isServe) {
   appendFileSync(${JSON.stringify(spawnLog)}, "serve\\n");
+  appendFileSync(${JSON.stringify(spawnLog)}, "autosync=" + (process.env.ENGRAM_CLOUD_AUTOSYNC ?? "<unset>") + "\\n");
   ${exitCode === undefined
       ? `const server = createServer(async (req, res) => {
   if (req.url === "/sessions") {
@@ -258,6 +259,24 @@ test("a slow health probe never authorizes a duplicate spawn", async () => {
 
     assert.equal(await countSpawns(spawnLog), 1, "concurrent hooks share one spawned server");
   });
+});
+
+test("a plugin-launched server starts with cloud autosync enabled", async () => {
+  const previous = process.env.ENGRAM_CLOUD_AUTOSYNC;
+  delete process.env.ENGRAM_CLOUD_AUTOSYNC;
+  try {
+    await withFixture({ readyAfterMs: 0 }, async ({ hooks, ctx, spawnLog }) => {
+      await hooks.get("session_start")({}, ctx);
+
+      assert.equal(await countSpawns(spawnLog), 1, "the plugin spawns the server");
+      const log = await readFile(spawnLog, "utf8");
+      assert.ok(log.split("\n").includes("autosync=1"),
+        "the daemon must opt into cloud autosync, like the Claude Code and Codex launchers");
+    });
+  } finally {
+    if (previous === undefined) delete process.env.ENGRAM_CLOUD_AUTOSYNC;
+    else process.env.ENGRAM_CLOUD_AUTOSYNC = previous;
+  }
 });
 
 test("a child that exits before readiness surfaces a normalized tool error", async () => {
