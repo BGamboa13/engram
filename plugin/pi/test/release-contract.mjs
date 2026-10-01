@@ -16,7 +16,7 @@ if (installerPinMatches.length !== 1) {
 }
 
 const installerVersion = installerPinMatches[0][1];
-// The Go setup pin stays on the published version until 0.1.17 is available on npm.
+// The Go setup pin stays on the published version until 0.2.0 is available on npm.
 if (installerVersion !== "0.1.16") {
 	throw new Error(`Pi installer pin npm:gentle-engram@${installerVersion} must remain at published version 0.1.16 until the next npm release`);
 }
