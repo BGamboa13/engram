@@ -28,8 +28,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/command"
-	"github.com/Gentleman-Programming/engram/v2/internal/mcp"
+	"github.com/Gentleman-Programming/engram/v3/internal/command"
+	"github.com/Gentleman-Programming/engram/v3/internal/mcp"
 )
 
 var (

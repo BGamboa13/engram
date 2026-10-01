@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/store"
-	engramsync "github.com/Gentleman-Programming/engram/v2/internal/sync"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
+	engramsync "github.com/Gentleman-Programming/engram/v3/internal/sync"
 )
 
 func TestCloudCLIProjectInputUsesSinglePathUnescape(t *testing.T) {
