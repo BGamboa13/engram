@@ -82,7 +82,7 @@ pi install npm:gentle-engram@0.2.0
 pi-engram init
 ```
 
-Use this quick start if `gentle-engram@0.2.0` is available on npm; otherwise wait for its publication before running these commands for native-only setup. Published `0.1.16` still registers Engram MCP during `pi-engram init`, so do not use it for native-only setup. Go's `engram setup pi` remains pinned to `0.1.16` pending a separate pin update.
+Go's `engram setup pi` installs the same `0.2.0` pin. Earlier `0.1.16` still registers Engram MCP during `pi-engram init`, so do not use it for native-only setup.
 
 Restart Pi after installation, then ask Pi what it remembers about the current project or call `mem_context`.
 
@@ -298,7 +298,7 @@ There is no automatic inference: editing files in another repository never chang
 
 | Symptom                                                      | Fix                                                                                                                                                                                                                                                                     |
 | ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `mem_*` tools are missing                                    | If `gentle-engram@0.2.0` is available on npm, install/verify `npm:gentle-engram@0.2.0`, run `pi-engram init`, then restart Pi. Published `0.1.16` init still registers Engram MCP; do not use it for native-only setup.                                                                                    |
+| `mem_*` tools are missing                                    | Install/verify `npm:gentle-engram@0.2.0`, run `pi-engram init`, then restart Pi. Earlier `0.1.16` init still registers Engram MCP; do not use it for native-only setup.                                                                                                 |
 | Pi cannot find `engram`                                      | Set `ENGRAM_BIN=/absolute/path/to/engram`.                                                                                                                                                                                                                              |
 | Session capture should use another server                    | Set `ENGRAM_URL=http://host:7437`.                                                                                                                                                                                                                                      |
 | Pi shows `error MCP: 0/N servers` but `mem_*` works          | That status covers Pi's MCP servers, not Engram's Pi-native HTTP tools. Check `~/.pi/agent/mcp.json` for stale/unreachable servers such as remote OAuth services. |
