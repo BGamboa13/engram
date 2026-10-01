@@ -299,6 +299,11 @@ test("a child that exits before readiness never escapes the session hooks", asyn
 
     const result = await hooks.get("before_agent_start")({ systemPrompt: "base", prompt: "hello there" }, ctx);
     assert.match(result.systemPrompt, /^base\n\n/, "memory instructions still reach the agent");
+
+    const options = { appendSystemPrompt: "existing" };
+    const structured = await hooks.get("before_agent_start")({ systemPrompt: "base", systemPromptOptions: options, prompt: "hello there" }, ctx);
+    assert.equal(structured, undefined, "structured options never receive a forced replacement");
+    assert.match(options.appendSystemPrompt, /^existing\n\n## Engram Persistent Memory — Protocol/);
   });
 });
 
