@@ -282,6 +282,18 @@ MCP tool calls still use Engram core's canonical project resolver at call time. 
 }
 ```
 
+### Cross-project saves
+
+Each Pi runtime session is registered `project_owned` and keeps exactly one owning project: the project detected for Pi's working directory (or, when detection is unresolved, the first explicit project that registers it). Saving into another repository or worktree is explicit only:
+
+- `mem_save`, `mem_save_prompt`, and `mem_session_summary` accept `project: "name"` or `cwd: "/path/inside/other/repo"`.
+- `cwd` is resolved through the same server detection as `/project/current`. An ambiguous or unresolved `cwd` fails with the detection hint and available projects instead of guessing. When both `project` and `cwd` are set they must agree (case-insensitive), otherwise the call fails before anything is written.
+- When the target differs from the runtime session's owning project, Pi registers a derived satellite session `<runtimeID>@<project>` as `project_owned` under the target project with no directory and writes with it. `cwd` only resolves the target project; newly created satellites have an empty stored directory and are never implicit directory-matched runtime candidates for other MCP agents. The runtime session is never re-registered under the target, so no `session_project_conflict` occurs. The satellite renews its lease on every write, concurrent writes share one registration, and an ended satellite resumes through the normal `<id>:resume:N` continuation. Pi ends its satellites when the runtime session quits; after an extension reload they stay unended and only their local lease lapses.
+- Before every satellite registration dispatch (including transport retries and the single bounded recovery replay), Pi requires `GET /health` to advertise `capabilities.isolated_session_registration: true` (literal boolean). Missing, false, or malformed capabilities fail closed with upgrade guidance before any satellite POST; no version floor is guessed. Pi sends `isolated: true`, which makes the server validate the root and selected continuation's directories atomically before lease renewal or ownership repair. A previously persisted nonblank directory returns `409 session_isolation_conflict` without mutation; it is never silently cleared. Same-project runtime registration does not require this capability.
+- Same-project writes, and writes without an explicit target, keep using the runtime session exactly as before.
+
+There is no automatic inference: editing files in another repository never changes where memories go. Prompt and passive capture always target the detected project.
+
 ## Troubleshooting
 
 | Symptom                                                      | Fix                                                                                                                                                                                                                                                                     |
@@ -293,7 +305,7 @@ MCP tool calls still use Engram core's canonical project resolver at call time. 
 | Existing Pi `mcpServers.engram` entry                         | Manually remove only that key from the warned `mcp.json` path and restart/reload Pi; setup never replaces user-owned MCP config.                                                                                                                                                                                                                                           |
 | `mem_current_project` reports `/project/current` unsupported | Restart or upgrade the running `engram serve`; check `ENGRAM_URL`/`ENGRAM_BIN`. If `.engram/config.json` exists, Pi uses it as a temporary fallback.                                                                                                                    |
 | `mem_session_summary` cannot detect a project                | Ask the user which project should receive the summary, then retry `mem_session_summary` with `project: "name"`.                                                                                                                                                         |
-| Pi warns that its runtime session belongs to another project | Pi registers runtime sessions as `project_owned`. If Engram already persists that session under another nonblank project, its structured `409 session_project_conflict` response suppresses prompt and passive capture even after Pi restarts. Start a fresh Pi session in the current project. |
+| Pi warns that its runtime session belongs to another project | Pi registers runtime sessions as `project_owned`. If Engram already persists that session under another nonblank project, its structured `409 session_project_conflict` response suppresses prompt and passive capture even after Pi restarts. Start a fresh Pi session in the current project. To save into another project from this session, pass `project` or `cwd` explicitly (see [Cross-project saves](#cross-project-saves)). |
 | Status bar shows `🧠 repos · ambiguous project`             | Pi was started from a parent directory that contains multiple git repos. Run Pi from inside a single repo, or add `.engram/config.json` with `"project_name": "my-project"` to the ambiguous directory.                                                                 |
 
 ## Next steps
